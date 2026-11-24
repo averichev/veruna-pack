@@ -1,0 +1,23 @@
+slug = "moy-host"
+profile = "tauri"
+app = "apps/desktop"
+exclude = ["vpn-manager"]
+push_tag = false
+targets = [
+    { os = "macos", arch = "universal" },
+    { os = "linux", arch = "x86_64" },
+    { os = "windows", arch = "x86_64" },
+]
+
+[frontend]
+path = "apps/desktop"
+version_env = "VITE_APP_VERSION"
+
+[tauri]
+release_config = "src-tauri/tauri.release.conf.json"
+toolchain = "stable"
+
+[signing]
+private_key_env = "TAURI_SIGNING_PRIVATE_KEY"
+private_key_file = "~/.tauri/host-util.key"
+password_env = "TAURI_SIGNING_PRIVATE_KEY_PASSWORD"

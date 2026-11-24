@@ -1,0 +1,25 @@
+slug = "mockport"
+profile = "standalone"
+app = "."
+push_tag = false
+targets = [
+    { os = "linux", arch = "x86_64" },
+    { os = "windows", arch = "x86_64" },
+    { os = "macos", arch = "aarch64" },
+]
+
+[rust]
+binary = "mockport"
+version_env = "MOCKPORT_RELEASE_VERSION"
+toolchain = "stable"
+version_args = ["--version"]
+
+[frontend]
+path = "frontend"
+version_env = "VITE_APP_VERSION"
+
+[signing]
+identity = "release.config.json"
+private_key_env = "MOCKPORT_SIGNING_KEY"
+private_key_file = "~/.mockport-signing/publisher.private.pem"
+password_env = "MOCKPORT_KEY_PASSPHRASE"
