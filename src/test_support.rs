@@ -3,6 +3,7 @@ use crate::{
     config::Project,
     git,
     plan::Plan,
+    selection::Selection,
     signing::{self, Material},
 };
 use anyhow::Result;
@@ -65,7 +66,10 @@ private_key_file = '{}'
     }
 
     pub fn project(&self) -> Project {
-        Project::load(&self.root.join("release.toml")).unwrap()
+        Project::load(&self.root.join("release.toml"), Selection::default()).unwrap()
+    }
+    pub fn discover(&self) -> Result<Project> {
+        Project::discover(&self.root, Selection::default())
     }
     pub fn use_defaults(&self) {
         fs::remove_file(self.root.join("release.toml")).unwrap();

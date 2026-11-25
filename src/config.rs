@@ -1,4 +1,4 @@
-use crate::{discovery, git};
+use crate::{discovery, git, selection::Selection};
 use anyhow::{Context, Result, bail, ensure};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -139,6 +139,7 @@ pub struct Signing {
 pub struct Project {
     pub root: PathBuf,
     pub config_path: Option<PathBuf>,
+    selection: Selection,
     pub config: Config,
     pub identity: Value,
     pub base_version: Version,
@@ -276,12 +277,12 @@ pub fn stable_version(value: &str) -> Result<Version> {
 }
 
 impl Project {
-    pub fn discover(directory: &Path) -> Result<Self> {
+    pub fn discover(directory: &Path, selection: Selection) -> Result<Self> {
         let root = PathBuf::from(git::read(directory, &["rev-parse", "--show-toplevel"])?);
-        Self::from_root(root, None)
+        Self::from_root(root, None, selection)
     }
 
-    pub fn load(path: &Path) -> Result<Self> {
+    pub fn load(path: &Path, selection: Selection) -> Result<Self> {
         let path = path
             .canonicalize()
             .with_context(|| format!("Не найден {}", path.display()))?;
@@ -290,10 +291,18 @@ impl Project {
             &["rev-parse", "--show-toplevel"],
         )?);
         let config_path = path.strip_prefix(&root)?.to_owned();
-        Self::from_root(root, Some(config_path))
+        Self::from_root(root, Some(config_path), selection)
     }
 
-    pub fn from_root(root: PathBuf, config_path: Option<PathBuf>) -> Result<Self> {
+    pub fn reload_at(&self, root: PathBuf) -> Result<Self> {
+        Self::from_root(root, self.config_path.clone(), self.selection.replay())
+    }
+
+    fn from_root(
+        root: PathBuf,
+        config_path: Option<PathBuf>,
+        mut selection: Selection,
+    ) -> Result<Self> {
         let path = root.join(config_path.as_deref().unwrap_or(Path::new("release.toml")));
         let bytes = match fs::read(&path) {
             Ok(bytes) => Some(bytes),
@@ -316,6 +325,7 @@ impl Project {
             None => discovery::resolve(
                 &root,
                 toml::from_str(text).with_context(|| format!("Неверный {}", path.display()))?,
+                &mut selection,
             )?,
         };
         config.validate()?;
@@ -325,7 +335,8 @@ impl Project {
         {
             ensure!(
                 root.join(path)
-                    .canonicalize()?
+                    .canonicalize()
+                    .with_context(|| format!("Недоступен путь {}", path.display()))?
                     .starts_with(root.canonicalize()?),
                 "Путь через symlink выходит за пределы Git-репозитория: {}",
                 path.display()
@@ -387,6 +398,7 @@ impl Project {
         Ok(Self {
             root,
             config_path,
+            selection,
             config,
             identity,
             base_version,

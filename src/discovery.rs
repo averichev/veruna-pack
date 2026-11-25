@@ -1,5 +1,8 @@
-use crate::config::{Config, Profile};
-use anyhow::{Context, Result, bail, ensure};
+use crate::{
+    config::{Config, Profile},
+    selection::{Choice, Selection},
+};
+use anyhow::{Context, Result, ensure};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeSet,
@@ -15,7 +18,8 @@ fn manifest(path: &Path) -> Result<toml::Value> {
     .with_context(|| format!("Неверный {}", path.display()))
 }
 
-fn children(path: &Path) -> Result<Vec<PathBuf>> {
+fn children(root: &Path, parent: &str) -> Result<Vec<PathBuf>> {
+    let path = root.join(parent);
     if !path.is_dir() {
         return Ok(Vec::new());
     }
@@ -23,24 +27,29 @@ fn children(path: &Path) -> Result<Vec<PathBuf>> {
     for entry in fs::read_dir(path)? {
         let entry = entry?;
         if entry.file_type()?.is_dir() && !entry.file_name().to_string_lossy().starts_with('.') {
-            result.push(entry.path());
+            result.push(Path::new(parent).join(entry.file_name()));
         }
     }
-    result.sort();
     Ok(result)
 }
 
 fn binaries(app: &Path, cargo: &toml::Value) -> Result<BTreeSet<String>> {
     let mut names = BTreeSet::new();
+    let mut explicit_paths = BTreeSet::new();
     if let Some(bins) = cargo.get("bin").and_then(toml::Value::as_array) {
         for bin in bins {
             if let Some(name) = bin.get("name").and_then(toml::Value::as_str) {
                 names.insert(name.to_owned());
             }
+            if let Some(path) = bin.get("path").and_then(toml::Value::as_str) {
+                explicit_paths.insert(app.join(path));
+            }
         }
     }
     if package_value(cargo, "autobins").and_then(toml::Value::as_bool) != Some(false) {
-        if app.join("src/main.rs").is_file()
+        let main = app.join("src/main.rs");
+        if main.is_file()
+            && !explicit_paths.contains(&main)
             && let Some(name) = package_value(cargo, "name").and_then(toml::Value::as_str)
         {
             names.insert(name.to_owned());
@@ -50,17 +59,26 @@ fn binaries(app: &Path, cargo: &toml::Value) -> Result<BTreeSet<String>> {
             for entry in fs::read_dir(directory)? {
                 let entry = entry?;
                 let path = entry.path();
-                if (entry.file_type()?.is_file() && path.extension().is_some_and(|e| e == "rs"))
-                    || (entry.file_type()?.is_dir() && path.join("main.rs").is_file())
+                let file_type = entry.file_type()?;
+                let name = if file_type.is_file()
+                    && path.extension().is_some_and(|e| e == "rs")
+                    && !explicit_paths.contains(&path)
                 {
-                    names.insert(
-                        path.file_stem()
-                            .context("Нет имени Cargo binary")?
-                            .to_str()
-                            .context("Имя binary должно быть UTF-8")?
-                            .to_owned(),
-                    );
-                }
+                    path.file_stem()
+                } else if file_type.is_dir()
+                    && path.join("main.rs").is_file()
+                    && !explicit_paths.contains(&path.join("main.rs"))
+                {
+                    path.file_name()
+                } else {
+                    continue;
+                };
+                names.insert(
+                    name.context("Нет имени Cargo binary")?
+                        .to_str()
+                        .context("Имя binary должно быть UTF-8")?
+                        .to_owned(),
+                );
             }
         }
     }
@@ -79,35 +97,29 @@ fn in_app(app: &Path, path: &str) -> PathBuf {
     }
 }
 
-fn select_app(root: &Path, profile: Option<&Profile>, exclude: &[PathBuf]) -> Result<PathBuf> {
+fn select_app(
+    root: &Path,
+    profile: Option<&Profile>,
+    exclude: &[PathBuf],
+    selection: &mut Selection,
+) -> Result<PathBuf> {
     // Conventional application locations; custom layouts use a single `app` override.
-    let mut directories = vec![root.to_owned()];
-    directories.extend(children(root)?);
+    let mut directories = vec![PathBuf::from(".")];
+    directories.extend(children(root, "")?);
     for container in ["apps", "crates", "packages"] {
-        directories.extend(children(&root.join(container))?);
+        directories.extend(children(root, container)?);
     }
     directories.sort();
     directories.dedup();
-    directories.retain(|directory| {
-        let path = directory.strip_prefix(root).unwrap();
-        !exclude.iter().any(|excluded| path.starts_with(excluded))
-    });
+    directories.retain(|path| !exclude.iter().any(|excluded| path.starts_with(excluded)));
     if profile != Some(&Profile::Standalone) {
         let tauri: Vec<_> = directories
             .iter()
-            .filter(|p| p.join("src-tauri/tauri.conf.json").is_file())
+            .filter(|p| root.join(p).join("src-tauri/tauri.conf.json").is_file())
+            .cloned()
             .collect();
         if !tauri.is_empty() {
-            ensure!(
-                tauri.len() == 1,
-                "Найдено несколько Tauri-приложений. Укажите app в release.toml"
-            );
-            let path = tauri[0].strip_prefix(root)?;
-            return Ok(if path.as_os_str().is_empty() {
-                PathBuf::from(".")
-            } else {
-                path.to_owned()
-            });
+            return selection.choose(Choice::Application("Tauri"), tauri);
         }
     }
     ensure!(
@@ -120,17 +132,13 @@ fn select_app(root: &Path, profile: Option<&Profile>, exclude: &[PathBuf]) -> Re
     }
     let mut standalone = Vec::new();
     for directory in directories {
-        let path = directory.join("Cargo.toml");
-        if path.is_file() && !binaries(&directory, &manifest(&path)?)?.is_empty() {
+        let app = root.join(&directory);
+        let path = app.join("Cargo.toml");
+        if path.is_file() && !binaries(&app, &manifest(&path)?)?.is_empty() {
             standalone.push(directory);
         }
     }
-    ensure!(
-        standalone.len() <= 1,
-        "Найдено несколько Rust-приложений. Укажите app в release.toml"
-    );
-    standalone.first().map(|p| p.strip_prefix(root).map(Path::to_owned)).transpose()?
-        .context("Не найдено Rust/Tauri-приложение. Для нестандартной структуры укажите app в release.toml")
+    selection.choose(Choice::Application("Rust"), standalone)
 }
 
 fn merge(base: &mut Value, overrides: Value) {
@@ -179,7 +187,7 @@ fn frontend(root: &Path, app: &Path, overrides: &Value, tauri: bool) -> Result<V
     })
 }
 
-pub fn resolve(root: &Path, overrides: Value) -> Result<Config> {
+pub fn resolve(root: &Path, overrides: Value, selection: &mut Selection) -> Result<Config> {
     let profile: Option<Profile> = overrides
         .get("profile")
         .map(|value| serde_json::from_value(value.clone()))
@@ -194,7 +202,7 @@ pub fn resolve(root: &Path, overrides: Value) -> Result<Config> {
     }
     let app = match overrides.get("app") {
         Some(value) => serde_json::from_value::<PathBuf>(value.clone())?,
-        None => select_app(root, profile.as_ref(), &exclude)?,
+        None => select_app(root, profile.as_ref(), &exclude, selection)?,
     };
     crate::config::relative(&app)?;
     let profile = profile.unwrap_or_else(|| {
@@ -222,12 +230,7 @@ pub fn resolve(root: &Path, overrides: Value) -> Result<Config> {
         name.to_owned()
     } else {
         let names = binaries(&root.join(&app), &cargo)?;
-        if names.len() != 1 {
-            bail!(
-                "Нельзя однозначно определить Cargo binary ({package}). Задайте package.default-run в Cargo.toml или rust.binary в release.toml"
-            );
-        }
-        names.into_iter().next().unwrap()
+        selection.choose(Choice::Binary(package), names.into_iter().collect())?
     };
     let slug: String = match overrides.get("slug") {
         Some(value) => serde_json::from_value(value.clone())?,
@@ -287,7 +290,7 @@ mod tests {
         )
         .unwrap();
         f.commit("feat: default configuration");
-        let project = Project::discover(&f.root.join("src")).unwrap();
+        let project = Project::discover(&f.root.join("src"), Selection::default()).unwrap();
         assert_eq!(project.config.profile, Profile::Standalone);
         assert_eq!(project.config.slug, "sample");
         assert_eq!(
@@ -310,7 +313,7 @@ mod tests {
             &f.temp.path().join("source.tar"),
         )
         .unwrap();
-        let staged = Project::from_root(source, None).unwrap();
+        let staged = project.reload_at(source).unwrap();
         assert_eq!(project.fingerprint, staged.fingerprint);
         assert!(!staged.root.join(".git").exists());
     }
@@ -321,7 +324,7 @@ mod tests {
         f.use_defaults();
         let config = f.root.join("release.toml");
         fs::write(&config, "exclude = ['independent']\n[rust]\nfeatures = ['custom']\n[signing]\nprivate_key_file = '/local/key.pem'\n").unwrap();
-        let project = Project::discover(&f.root).unwrap();
+        let project = f.discover().unwrap();
         let rust = project.config.rust.unwrap();
         assert_eq!(rust.binary, "sample");
         assert_eq!(rust.version_env, "SAMPLE_RELEASE_VERSION");
@@ -333,58 +336,66 @@ mod tests {
         assert_eq!(project.config.exclude, [PathBuf::from("independent")]);
         assert_eq!(project.config.targets.len(), 3);
         fs::write(&config, "[rust]\nfeautres = ['typo']\n").unwrap();
-        let error = format!("{:#}", Project::discover(&f.root).unwrap_err());
+        let error = format!("{:#}", f.discover().unwrap_err());
         assert!(error.contains("unknown field `feautres`"), "{error}");
         fs::write(&config, "[not valid toml").unwrap();
-        assert!(Project::discover(&f.root).is_err());
+        assert!(f.discover().is_err());
     }
 
     #[test]
     fn missing_explicit_config_is_an_error_but_implicit_config_is_optional() {
         let f = Fixture::new("0.2.4", false);
         f.use_defaults();
-        assert!(Project::load(&f.root.join("release.toml")).is_err());
-        let absent = Project::discover(&f.root).unwrap();
+        assert!(Project::load(&f.root.join("release.toml"), Selection::default()).is_err());
+        let absent = f.discover().unwrap();
         fs::write(f.root.join("release.toml"), "# Only defaults\n").unwrap();
-        assert_eq!(
-            absent.fingerprint,
-            Project::discover(&f.root).unwrap().fingerprint
-        );
+        assert_eq!(absent.fingerprint, f.discover().unwrap().fingerprint);
     }
 
     #[test]
     fn multiple_binaries_require_a_default_or_an_override() {
         let f = Fixture::new("0.2.4", false);
         f.use_defaults();
+        let unambiguous = f.discover().unwrap();
         fs::create_dir(f.root.join("src/bin")).unwrap();
         fs::write(f.root.join("src/bin/admin.rs"), "fn main() {}\n").unwrap();
-        let error = format!("{:#}", Project::discover(&f.root).unwrap_err());
+        assert!(unambiguous.reload_at(f.root.clone()).is_err());
+        let error = format!("{:#}", f.discover().unwrap_err());
+        assert!(error.contains("admin, sample"), "{error}");
         assert!(error.contains("rust.binary"), "{error}");
         fs::write(f.root.join("release.toml"), "[rust]\nbinary = 'admin'\n").unwrap();
-        assert_eq!(
-            Project::discover(&f.root)
-                .unwrap()
-                .config
-                .rust
-                .unwrap()
-                .binary,
-            "admin"
-        );
+        assert_eq!(f.discover().unwrap().config.rust.unwrap().binary, "admin");
         fs::remove_file(f.root.join("release.toml")).unwrap();
         fs::write(
             f.root.join("Cargo.toml"),
             "[package]\nname='sample'\nversion='0.2.4'\ndefault-run='sample'\n",
         )
         .unwrap();
-        assert_eq!(
-            Project::discover(&f.root)
-                .unwrap()
-                .config
-                .rust
-                .unwrap()
-                .binary,
-            "sample"
-        );
+        assert_eq!(f.discover().unwrap().config.rust.unwrap().binary, "sample");
+    }
+
+    #[test]
+    fn explicit_bin_paths_offer_only_their_cargo_names() {
+        let f = Fixture::new("0.2.4", false);
+        f.use_defaults();
+        fs::create_dir_all(f.root.join("src/bin/tool")).unwrap();
+        fs::write(f.root.join("src/bin/tool/main.rs"), "fn main() {}\n").unwrap();
+        fs::write(
+            f.root.join("Cargo.toml"),
+            "[package]\nname='sample'\nversion='0.2.4'\nedition='2024'\n\
+             [[bin]]\nname='server'\npath='src/main.rs'\n\
+             [[bin]]\nname='admin'\npath='./src/bin/tool/main.rs'\n",
+        )
+        .unwrap();
+        let project = Project::discover(
+            &f.root,
+            Selection::with_prompt(|_, options, _| {
+                assert_eq!(options, ["admin", "server"]);
+                Ok(1)
+            }),
+        )
+        .unwrap();
+        assert_eq!(project.config.slug, "server");
     }
 
     #[test]
@@ -405,7 +416,7 @@ mod tests {
             r#"{"scripts":{"build":"vite build"}}"#,
         )
         .unwrap();
-        let project = Project::discover(&f.root).unwrap();
+        let project = f.discover().unwrap();
         assert_eq!(project.config.profile, Profile::Tauri);
         assert_eq!(project.config.app, Path::new("apps/desktop"));
         assert_eq!(project.config.slug, "sample-desktop");
@@ -423,22 +434,25 @@ mod tests {
         let other = f.root.join("apps/other/src-tauri");
         fs::create_dir_all(&other).unwrap();
         fs::copy(tauri.join("tauri.conf.json"), other.join("tauri.conf.json")).unwrap();
-        assert!(
-            format!("{:#}", Project::discover(&f.root).unwrap_err())
-                .contains("несколько Tauri-приложений")
-        );
+        let chosen = Project::discover(
+            &f.root,
+            Selection::with_prompt(|_, options, _| {
+                assert_eq!(options, ["apps/desktop", "apps/other"]);
+                Ok(0)
+            }),
+        )
+        .unwrap();
+        assert_eq!(chosen.config.app, Path::new("apps/desktop"));
+        assert!(format!("{:#}", f.discover().unwrap_err()).contains("несколько Tauri-приложений"));
         fs::write(f.root.join("release.toml"), "exclude = ['apps/other']\n").unwrap();
-        assert_eq!(
-            Project::discover(&f.root).unwrap().config.app,
-            Path::new("apps/desktop")
-        );
+        assert_eq!(f.discover().unwrap().config.app, Path::new("apps/desktop"));
         fs::write(
             tauri.join("tauri.release.conf.json"),
             r#"{"bundle":{"active":true}}"#,
         )
         .unwrap();
         assert!(
-            Project::discover(&f.root)
+            f.discover()
                 .unwrap()
                 .config
                 .tauri
@@ -452,8 +466,7 @@ mod tests {
         )
         .unwrap();
         assert!(
-            format!("{:#}", Project::discover(&f.root).unwrap_err())
-                .contains("release_config не должен менять")
+            format!("{:#}", f.discover().unwrap_err()).contains("release_config не должен менять")
         );
     }
 
@@ -472,14 +485,33 @@ mod tests {
             .unwrap();
             fs::write(app.join("src/main.rs"), "fn main() {}\n").unwrap();
         }
-        let error = format!("{:#}", Project::discover(&f.root).unwrap_err());
+        let error = format!("{:#}", f.discover().unwrap_err());
         assert!(error.contains("несколько Rust-приложений"), "{error}");
+        assert!(error.contains("apps/first, apps/second"), "{error}");
+        fs::write(
+            f.root.join("release.toml"),
+            "[signing]\nidentity = 'release.config.json'\n",
+        )
+        .unwrap();
+        let chosen = Project::discover(
+            &f.root,
+            Selection::with_prompt(|_, options, _| {
+                assert_eq!(options, ["apps/first", "apps/second"]);
+                Ok(1)
+            }),
+        )
+        .unwrap();
+        assert_eq!(chosen.config.app, Path::new("apps/second"));
+        assert_eq!(
+            chosen.reload_at(f.root.clone()).unwrap().fingerprint,
+            chosen.fingerprint
+        );
         fs::write(
             f.root.join("release.toml"),
             "app = 'apps/second'\n[signing]\nidentity = 'release.config.json'\n",
         )
         .unwrap();
-        assert_eq!(Project::discover(&f.root).unwrap().config.slug, "second");
+        assert_eq!(f.discover().unwrap().config.slug, "second");
     }
 
     #[test]
@@ -503,7 +535,7 @@ mod tests {
         )
         .unwrap();
         fs::write(f.root.join("release.toml"), "[frontend]\nenabled = false\n").unwrap();
-        let frontend = Project::discover(&f.root).unwrap().config.frontend.unwrap();
+        let frontend = f.discover().unwrap().config.frontend.unwrap();
         assert!(!frontend.enabled);
         assert_eq!(frontend.path, Path::new("frontend"));
     }

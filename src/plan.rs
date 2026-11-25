@@ -415,7 +415,7 @@ mod tests {
             .output()
             .unwrap();
         assert!(result.status.success());
-        let project = Project::load(&clone.join("release.toml")).unwrap();
+        let project = Project::load(&clone.join("release.toml"), Default::default()).unwrap();
         assert!(
             format!("{:#}", calculate(&project).unwrap_err())
                 .contains("git fetch --unshallow --tags origin")

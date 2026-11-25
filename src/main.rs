@@ -7,6 +7,7 @@ mod inspect;
 mod node;
 mod plan;
 mod process;
+mod selection;
 mod signing;
 #[cfg(test)]
 mod test_support;
@@ -41,9 +42,11 @@ enum Action {
 
 fn run() -> Result<()> {
     let args = Cli::parse();
+    let selection =
+        selection::Selection::for_cli(matches!(args.command, Action::Plan { json: true }));
     let project = match args.config {
-        Some(path) => config::Project::load(&path)?,
-        None => config::Project::discover(&std::env::current_dir()?)?,
+        Some(path) => config::Project::load(&path, selection)?,
+        None => config::Project::discover(&std::env::current_dir()?, selection)?,
     };
     match args.command {
         Action::Plan { json } => {

@@ -27,7 +27,7 @@ pub fn build(project: &Project) -> Result<()> {
 
 fn unchanged(project: &Project, expected: &Plan) -> Result<()> {
     git::clean(project)?;
-    let reloaded = Project::from_root(project.root.clone(), project.config_path.clone())?;
+    let reloaded = project.reload_at(project.root.clone())?;
     ensure!(
         reloaded.fingerprint == project.fingerprint,
         "Конфигурация изменилась во время сборки"
@@ -89,7 +89,7 @@ fn execute(
             &work.path().join("source.tar"),
         )?;
         fs::remove_file(work.path().join("source.tar"))?;
-        let staged_project = Project::from_root(source, project.config_path.clone()).context(
+        let staged_project = project.reload_at(source).context(
             "Snapshot должен содержать манифесты, закреплённую идентичность и используемые настройки",
         )?;
         ensure!(
@@ -231,13 +231,18 @@ fn publish(source: &Path, destination: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{Fixture, fake_build, verify_transaction};
+    use crate::{
+        selection::Selection,
+        test_support::{Fixture, fake_build, verify_transaction},
+    };
     use std::cell::Cell;
 
     #[test]
-    fn partial_config_builds_from_snapshot_and_repeats() {
+    fn chosen_binary_builds_from_snapshot_and_repeats() {
         let f = Fixture::seeded(false);
         f.use_defaults();
+        fs::create_dir(f.root.join("src/bin")).unwrap();
+        fs::write(f.root.join("src/bin/admin.rs"), "fn main() {}\n").unwrap();
         fs::write(
             f.root.join("release.toml"),
             format!(
@@ -247,7 +252,16 @@ mod tests {
         )
         .unwrap();
         f.commit("chore: use automatic release configuration");
-        let project = Project::discover(&f.root).unwrap();
+        let project = Project::discover(
+            &f.root,
+            Selection::with_prompt(|_, options, default| {
+                assert_eq!(options, ["admin", "sample"]);
+                assert_eq!(options[default], "sample");
+                Ok(0)
+            }),
+        )
+        .unwrap();
+        assert_eq!(project.config.slug, "admin");
         execute(&project, fake_build, verify_transaction).unwrap();
         let tag = f.git(&["rev-parse", "v0.3.0"]);
         fs::remove_file(f.temp.path().join("test-key.pem")).unwrap();
@@ -460,7 +474,7 @@ mod tests {
         let config = "release 'custom' $(printf expanded).toml";
         fs::rename(f.root.join("release.toml"), f.root.join(config)).unwrap();
         f.commit("chore: rename release configuration");
-        let p = Project::load(&f.root.join(config)).unwrap();
+        let p = Project::load(&f.root.join(config), Selection::default()).unwrap();
         let plan = plan::calculate(&p).unwrap();
         fs::create_dir_all(f.release()).unwrap();
         fs::write(f.release().join("keep.txt"), "diagnostics").unwrap();

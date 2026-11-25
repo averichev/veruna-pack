@@ -11,6 +11,7 @@ repository = "https://github.com/averichev/veruna-pack"
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive"] }
+dialoguer = { version = "0.12", default-features = false }
 ed25519-dalek = { version = "2.2", features = ["pkcs8", "pem"] }
 flate2 = "1"
 fs2 = "0.4"
