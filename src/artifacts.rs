@@ -221,17 +221,16 @@ fn sums(directory: &Path, plan: &Plan) -> Result<String> {
 }
 
 fn metadata_differences(expected: serde_json::Value, actual: serde_json::Value) -> String {
-    expected
-        .as_object()
-        .expect("metadata is an object")
-        .iter()
-        .filter_map(|(field, expected)| {
-            let actual = &actual[field];
-            (expected != actual)
-                .then(|| format!("  {field}: ожидается {expected}; в выпуске {actual}"))
-        })
-        .collect::<Vec<_>>()
-        .join("\n")
+    let mut differences = Vec::new();
+    for (field, expected) in expected.as_object().expect("metadata is an object") {
+        let actual = &actual[field];
+        if expected != actual {
+            differences.push(format!(
+                "  {field}: ожидается {expected}; в выпуске {actual}"
+            ));
+        }
+    }
+    differences.join("\n")
 }
 
 pub fn verify(project: &Project, plan: &Plan, directory: &Path) -> Result<()> {
@@ -265,7 +264,7 @@ pub fn verify_using(
         let extra: Vec<_> = names.difference(&expected_names).cloned().collect();
         let list = |names: &[String]| {
             if names.is_empty() {
-                "нет".into()
+                " нет".into()
             } else {
                 format!("\n  {}", names.join("\n  "))
             }
@@ -276,7 +275,7 @@ pub fn verify_using(
             ""
         };
         anyhow::bail!(
-            "Неверный состав выпуска {}\nОтсутствуют файлы ({}): {}\nЛишние файлы ({}): {}{legacy_hint}",
+            "Неверный состав выпуска {}\nОтсутствуют файлы ({}):{}\nЛишние файлы ({}):{}{legacy_hint}",
             directory.display(),
             missing.len(),
             list(&missing),
@@ -337,15 +336,15 @@ pub fn verify_using(
             "Метаданные артефакта в release.json не соответствуют плану: {}\n{differences}",
             spec.name
         );
-        let actual = record(directory, spec.clone())?;
+        let (size_bytes, sha256) = digest(&directory.join(&spec.name))?;
         ensure!(
-            *artifact == actual,
+            size_bytes > 0 && artifact.size_bytes == size_bytes && artifact.sha256 == sha256,
             "Повреждён файл {}\n  Размер: ожидается {} байт; фактически {} байт\n  SHA-256: ожидается {}; фактически {}",
             spec.name,
             artifact.size_bytes,
-            actual.size_bytes,
+            size_bytes,
             artifact.sha256,
-            actual.sha256
+            sha256
         );
         if let Some(signature) = &spec.signature {
             let signature_path = directory.join(signature);

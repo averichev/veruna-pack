@@ -409,23 +409,221 @@ mod tests {
     }
 
     #[test]
+    fn incomplete_release_reports_missing_extra_and_recovery_without_changes() {
+        let f = Fixture::seeded(false);
+        let p = f.project();
+        let plan = plan::calculate(&p).unwrap();
+        fs::create_dir_all(f.release()).unwrap();
+        let binary = "sample-0.3.0-linux-x86_64";
+        for (name, contents) in [
+            (binary, "binary"),
+            ("build.json", "{}"),
+            ("SHA256SUMS", "old"),
+        ] {
+            fs::write(f.release().join(name), contents).unwrap();
+        }
+        fs::remove_file(f.temp.path().join("test-key.pem")).unwrap();
+        let message = format!(
+            "{:#}",
+            execute(
+                &p,
+                |_, _, _, _, _| panic!("must preserve incomplete release"),
+                verify_transaction,
+            )
+            .unwrap_err()
+        );
+        assert!(message.contains(&format!("Отсутствуют файлы ({}):", plan.files.len() - 2)));
+        assert!(message.contains("\n  CHANGELOG.md\n"));
+        assert!(message.contains("\n  release.json\n"));
+        assert!(message.contains("\n  sample-0.3.0-windows-x86_64.exe\n"));
+        assert!(message.contains("Лишние файлы (1):\n  build.json"));
+        assert!(message.contains("Найден build.json без release.json"));
+        assert!(message.contains(&plan.source_commit));
+        assert!(message.find("Причина:").unwrap() < message.find("Как исправить:").unwrap());
+        assert!(message.contains("Если выпуск уже опубликован"));
+        assert!(message.contains("mv -n"));
+        assert!(message.contains("veruna-pack --config 'release.toml' build"));
+        assert_eq!(
+            fs::read_to_string(f.release().join(binary)).unwrap(),
+            "binary"
+        );
+        assert_eq!(
+            fs::read_to_string(f.release().join("build.json")).unwrap(),
+            "{}"
+        );
+        assert_eq!(
+            fs::read_to_string(f.release().join("SHA256SUMS")).unwrap(),
+            "old"
+        );
+        assert_eq!(fs::read_dir(f.release()).unwrap().count(), 3);
+        assert!(git::tag_commit(&f.root, "v0.3.0").unwrap().is_none());
+        assert!(!f.root.join("releases/.conflict-0.3.0-1").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_commands_preserve_copies_and_quote_paths_and_custom_config() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut f = Fixture::seeded(false);
+        let root = f
+            .root
+            .with_file_name("Копия с 'кавычкой' $(printf expanded)");
+        fs::rename(&f.root, &root).unwrap();
+        f.root = root;
+        let config = "release 'custom' $(printf expanded).toml";
+        fs::rename(f.root.join("release.toml"), f.root.join(config)).unwrap();
+        f.commit("chore: rename release configuration");
+        let p = Project::load(&f.root.join(config)).unwrap();
+        let plan = plan::calculate(&p).unwrap();
+        fs::create_dir_all(f.release()).unwrap();
+        fs::write(f.release().join("keep.txt"), "diagnostics").unwrap();
+        let previous = f.root.join("releases/.conflict-0.3.0-1");
+        fs::write(&previous, "previous diagnostics").unwrap();
+        let symlink = f.root.join("releases/.conflict-0.3.0-2");
+        std::os::unix::fs::symlink("missing", &symlink).unwrap();
+        let message =
+            release_conflict(&p, &plan, &f.release(), anyhow::anyhow!("test")).to_string();
+        let commands = message
+            .lines()
+            .filter(|line| line.starts_with("  "))
+            .map(str::trim_start)
+            .collect::<Vec<_>>()
+            .join("\n");
+        let stub = f.temp.path().join("veruna-pack");
+        fs::write(&stub, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        fs::set_permissions(&stub, fs::Permissions::from_mode(0o700)).unwrap();
+        let current_path = std::env::var_os("PATH").unwrap_or_default();
+        let search_path = std::env::join_paths(
+            std::iter::once(f.temp.path().to_path_buf())
+                .chain(std::env::split_paths(&current_path)),
+        )
+        .unwrap();
+        let result = std::process::Command::new("sh")
+            .env("PATH", search_path)
+            .args(["-c", &commands])
+            .output()
+            .unwrap();
+        assert!(
+            result.status.success(),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            String::from_utf8(result.stdout).unwrap(),
+            format!("--config\n{config}\nbuild\n")
+        );
+        assert!(!f.release().exists());
+        assert_eq!(
+            fs::read_to_string(f.root.join("releases/.conflict-0.3.0-3/keep.txt")).unwrap(),
+            "diagnostics"
+        );
+        assert_eq!(
+            fs::read_to_string(previous).unwrap(),
+            "previous diagnostics"
+        );
+        assert!(
+            fs::symlink_metadata(symlink)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn manifest_conflict_reports_every_mismatched_field() {
+        let f = Fixture::seeded(false);
+        let p = f.project();
+        execute(&p, fake_build, verify_transaction).unwrap();
+        let path = f.release().join("release.json");
+        let mut manifest: artifacts::Manifest =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest.source_commit = "0".repeat(40);
+        manifest.config_sha256 = "1".repeat(64);
+        manifest.version = "9.9.9".into();
+        manifest.previous_tag = None;
+        artifacts::write_json(&path, &manifest).unwrap();
+        let before = fs::read(&path).unwrap();
+        let tag = f.git(&["rev-parse", "v0.3.0"]);
+        let message = format!(
+            "{:#}",
+            execute(
+                &p,
+                |_, _, _, _, _| panic!("must preserve conflicting release"),
+                verify_transaction,
+            )
+            .unwrap_err()
+        );
+        assert!(message.contains(&format!(
+            "source_commit: ожидается \"{}\"; в выпуске \"{}\"",
+            git::head(&f.root).unwrap(),
+            manifest.source_commit
+        )));
+        assert!(message.contains(&format!(
+            "config_sha256: ожидается \"{}\"; в выпуске \"{}\"",
+            p.fingerprint, manifest.config_sha256
+        )));
+        assert!(message.contains("version: ожидается \"0.3.0\"; в выпуске \"9.9.9\""));
+        assert!(message.contains("previous_tag: ожидается \"v0.2.4\"; в выпуске null"));
+        assert_eq!(fs::read(path).unwrap(), before);
+        assert_eq!(f.git(&["rev-parse", "v0.3.0"]), tag);
+    }
+
+    #[test]
+    fn artifact_metadata_conflict_identifies_fields() {
+        let f = Fixture::seeded(false);
+        let p = f.project();
+        execute(&p, fake_build, verify_transaction).unwrap();
+        let path = f.release().join("release.json");
+        let mut manifest: artifacts::Manifest =
+            serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        manifest.artifacts[0].spec.os = "other".into();
+        manifest.artifacts[0].spec.roles = vec!["installer".into()];
+        artifacts::write_json(&path, &manifest).unwrap();
+        let plan = plan::calculate(&p).unwrap();
+        let message = format!(
+            "{:#}",
+            verify_transaction(&p, &plan, &f.release()).unwrap_err()
+        );
+        assert!(message.contains("sample-0.3.0-linux-x86_64"));
+        assert!(message.contains("os: ожидается \"linux\"; в выпуске \"other\""));
+        assert!(
+            message.contains(
+                "roles: ожидается [\"executable\",\"updater\"]; в выпуске [\"installer\"]"
+            )
+        );
+    }
+
+    #[test]
     fn corrupt_release_is_preserved_without_rebuild() {
         let f = Fixture::seeded(false);
         let p = f.project();
         execute(&p, fake_build, verify_transaction).unwrap();
         let file = f.release().join("sample-0.3.0-linux-x86_64");
-        fs::write(&file, "damage").unwrap();
+        let (size, hash) = artifacts::digest(&file).unwrap();
         let tag = f.git(&["rev-parse", "v0.3.0"]);
-        assert!(
-            execute(
-                &p,
-                |_, _, _, _, _| panic!("must preserve corrupt release"),
-                verify_transaction
-            )
-            .is_err()
-        );
-        assert_eq!(fs::read_to_string(file).unwrap(), "damage");
-        assert_eq!(tag, f.git(&["rev-parse", "v0.3.0"]));
+        for contents in [b"damage".to_vec(), vec![], vec![b'X'; size as usize]] {
+            fs::write(&file, &contents).unwrap();
+            let (actual_size, actual_hash) = artifacts::digest(&file).unwrap();
+            let message = format!(
+                "{:#}",
+                execute(
+                    &p,
+                    |_, _, _, _, _| panic!("must preserve corrupt release"),
+                    verify_transaction
+                )
+                .unwrap_err()
+            );
+            assert!(message.contains("Повреждён файл sample-0.3.0-linux-x86_64"));
+            assert!(message.contains(&format!(
+                "Размер: ожидается {size} байт; фактически {actual_size} байт"
+            )));
+            assert!(message.contains(&format!(
+                "SHA-256: ожидается {hash}; фактически {actual_hash}"
+            )));
+            assert_eq!(fs::read(&file).unwrap(), contents);
+            assert_eq!(tag, f.git(&["rev-parse", "v0.3.0"]));
+        }
     }
 
     #[test]
