@@ -1,6 +1,7 @@
 use crate::{
     artifacts,
     config::{Profile, Project, Target},
+    node::{self, Runtime},
     plan::Plan,
     process,
     signing::Material,
@@ -25,16 +26,18 @@ pub fn run(
         "Полный выпуск требует сборочный Mac с Apple SDK"
     );
     open_file_limit()?;
+    let node = node::resolve(project)?;
     preflight(project, output.parent().unwrap())?;
     let version = plan.version.as_ref().unwrap().to_string();
-    if let Some(frontend) = &project.config.frontend {
+    if let Some(frontend) = project.config.frontend.as_ref().filter(|f| f.enabled) {
         let directory = project.root.join(&frontend.path);
+        let node = node.as_ref().unwrap();
         process::run(
-            process::command(project, "npm", &directory).arg("ci"),
+            node.npm(project, &directory)?.arg("ci"),
             "npm ci (frontend)",
         )?;
         process::run(
-            process::command(project, "npm", &directory)
+            node.npm(project, &directory)?
                 .args(["run", "build"])
                 .env(&frontend.version_env, &version)
                 .env("VERUNA_RELEASE_VERSION", &version),
@@ -43,8 +46,15 @@ pub fn run(
     }
     fs::create_dir_all(cache)?;
     match project.config.profile {
-        Profile::Standalone => standalone(project, &version, output, cache),
-        Profile::Tauri => tauri(project, plan, output, cache, material),
+        Profile::Standalone => standalone(project, &version, output, cache, node.as_ref()),
+        Profile::Tauri => tauri(
+            project,
+            plan,
+            output,
+            cache,
+            material,
+            node.as_ref().unwrap(),
+        ),
     }
 }
 
@@ -84,18 +94,6 @@ fn open_file_limit() -> Result<()> {
 }
 
 fn preflight(project: &Project, work: &Path) -> Result<()> {
-    if project.config.frontend.is_some() {
-        let node = process::capture(
-            process::command(project, "node", &project.root).arg("--version"),
-            "Node.js",
-        )?;
-        ensure!(
-            semver::Version::parse(node.trim_start_matches('v'))?
-                >= semver::Version::new(22, 12, 0),
-            "Для выпуска нужен Node.js 22.12+: выбран {node}"
-        );
-        check(project, "npm", &["--version"])?;
-    }
     check(project, "xcrun", &["--sdk", "macosx", "--show-sdk-path"])?;
     let toolchain = match project.config.profile {
         Profile::Standalone => &project.config.rust.as_ref().unwrap().toolchain,
@@ -136,13 +134,23 @@ fn preflight(project: &Project, work: &Path) -> Result<()> {
     Ok(())
 }
 
-fn standalone(project: &Project, version: &str, output: &Path, cache: &Path) -> Result<()> {
+fn standalone(
+    project: &Project,
+    version: &str,
+    output: &Path,
+    cache: &Path,
+    node: Option<&Runtime>,
+) -> Result<()> {
     let settings = project.config.rust.as_ref().unwrap();
     let app = project.root.join(&project.config.app);
+    let rustc = process::tool_path(project, &settings.toolchain, "rustc")?;
     for target in &project.config.targets {
         let triple = target.rust(&Profile::Standalone);
         let target_dir = cache.join("standalone");
         let mut command = process::cargo(project, &app, &settings.toolchain);
+        if let Some(node) = node {
+            node.apply(&mut command)?;
+        }
         command
             .args([
                 if target.os == "linux" {
@@ -159,6 +167,8 @@ fn standalone(project: &Project, version: &str, output: &Path, cache: &Path) -> 
                 "--target-dir",
             ])
             .arg(&target_dir)
+            .env("RUSTC", &rustc)
+            .env("CARGO_BUILD_RUSTC", &rustc)
             .env(&settings.version_env, version)
             .env("VERUNA_RELEASE_VERSION", version);
         if !settings.features.is_empty() {
@@ -199,6 +209,7 @@ fn tauri(
     output: &Path,
     cache: &Path,
     material: &Material,
+    node: &Runtime,
 ) -> Result<()> {
     let Material::Tauri { encoded, password } = material else {
         unreachable!()
@@ -234,22 +245,21 @@ fn tauri(
             if bundle_root.exists() {
                 fs::remove_dir_all(&bundle_root)?;
             }
-            let mut command = process::command(project, "npm", &app);
-            command
-                .args([
-                    "exec", "--", "tauri", "build", "--ci", "--runner", &cargo, "--config",
-                ])
-                .arg(&settings.release_config)
-                .args([
-                    "--config",
-                    &override_name,
-                    "--target",
-                    target.rust(&Profile::Tauri),
-                    "--bundles",
-                    "app,dmg",
-                    "--",
-                    "--locked",
-                ]);
+            let mut command = node.npm(project, &app)?;
+            command.args(["exec", "--", "tauri", "build", "--ci", "--runner", &cargo]);
+            if let Some(path) = &settings.release_config {
+                command.arg("--config").arg(path);
+            }
+            command.args([
+                "--config",
+                &override_name,
+                "--target",
+                target.rust(&Profile::Tauri),
+                "--bundles",
+                "app,dmg",
+                "--",
+                "--locked",
+            ]);
             command
                 .env("TAURI_SIGNING_PRIVATE_KEY", encoded.as_str())
                 .env("TAURI_SIGNING_PRIVATE_KEY_PASSWORD", password.as_str())
@@ -257,10 +267,8 @@ fn tauri(
                 .env("CARGO_BUILD_RUSTC", &rustc)
                 .env("CARGO_TARGET_DIR", &target_dir)
                 .env("VITE_APP_VERSION", &version);
-            let path = std::env::var_os("PATH").unwrap_or_default();
-            let mut paths = vec![Path::new(&cargo).parent().unwrap().to_owned()];
-            paths.extend(std::env::split_paths(&path));
-            command.env("PATH", std::env::join_paths(paths)?);
+            process::prepend_path(&mut command, Path::new(&cargo).parent().unwrap())?;
+            node.apply(&mut command)?;
             process::run(&mut command, "Tauri macOS")?;
             bundle_root
         } else {
@@ -270,8 +278,8 @@ fn tauri(
                 target,
                 output.parent().unwrap(),
                 &override_name,
-                encoded,
-                password,
+                material,
+                node,
             )?
         };
         collect_tauri(project, &version, target, &bundle_root, output)?;
@@ -285,9 +293,12 @@ fn docker_tauri(
     target: &Target,
     work: &Path,
     override_name: &str,
-    encoded: &str,
-    password: &str,
+    material: &Material,
+    node: &Runtime,
 ) -> Result<PathBuf> {
+    let Material::Tauri { encoded, password } = material else {
+        unreachable!()
+    };
     let dockerfile = work.join("tauri.Dockerfile");
     fs::write(
         &dockerfile,
@@ -315,6 +326,7 @@ fn docker_tauri(
     for (key, value) in [
         ("APP_DIR", project.config.app.to_string_lossy().into_owned()),
         ("APP_VERSION", version.into()),
+        ("NODE_VERSION", node.version.to_string()),
         (
             "RUST_VERSION",
             project
@@ -333,6 +345,8 @@ fn docker_tauri(
                 .as_ref()
                 .unwrap()
                 .release_config
+                .as_deref()
+                .unwrap_or(Path::new(""))
                 .to_string_lossy()
                 .into_owned(),
         ),

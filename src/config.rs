@@ -1,4 +1,4 @@
-use crate::git;
+use crate::{discovery, git};
 use anyhow::{Context, Result, bail, ensure};
 use semver::Version;
 use serde::{Deserialize, Serialize};
@@ -85,8 +85,14 @@ fn vite() -> String {
 #[serde(deny_unknown_fields)]
 pub struct Frontend {
     pub path: PathBuf,
+    #[serde(default = "enabled")]
+    pub enabled: bool,
     #[serde(default = "vite")]
     pub version_env: String,
+}
+
+fn enabled() -> bool {
+    true
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -108,7 +114,7 @@ fn version_args() -> Vec<String> {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Tauri {
-    pub release_config: PathBuf,
+    pub release_config: Option<PathBuf>,
     #[serde(default = "stable")]
     pub toolchain: String,
     #[serde(default = "docker_rust")]
@@ -131,7 +137,7 @@ pub struct Signing {
 #[derive(Clone, Debug)]
 pub struct Project {
     pub root: PathBuf,
-    pub config_path: PathBuf,
+    pub config_path: Option<PathBuf>,
     pub config: Config,
     pub identity: Value,
     pub base_version: Version,
@@ -244,7 +250,9 @@ impl Config {
                     self.signing.identity.is_none(),
                     "Tauri читает закреплённый ключ из src-tauri/tauri.conf.json"
                 );
-                relative(&t.release_config)?;
+                if let Some(path) = &t.release_config {
+                    relative(path)?;
+                }
                 ensure!(toolchain(&t.toolchain), "Неверный tauri.toolchain");
                 stable_version(&t.docker_rust_version)?;
                 ensure!(
@@ -267,6 +275,11 @@ pub fn stable_version(value: &str) -> Result<Version> {
 }
 
 impl Project {
+    pub fn discover(directory: &Path) -> Result<Self> {
+        let root = PathBuf::from(git::read(directory, &["rev-parse", "--show-toplevel"])?);
+        Self::from_root(root, None)
+    }
+
     pub fn load(path: &Path) -> Result<Self> {
         let path = path
             .canonicalize()
@@ -276,13 +289,34 @@ impl Project {
             &["rev-parse", "--show-toplevel"],
         )?);
         let config_path = path.strip_prefix(&root)?.to_owned();
-        Self::from_root(root, config_path)
+        Self::from_root(root, Some(config_path))
     }
 
-    pub fn from_root(root: PathBuf, config_path: PathBuf) -> Result<Self> {
-        let bytes = fs::read(root.join(&config_path))?;
-        let config: Config =
-            toml::from_str(std::str::from_utf8(&bytes)?).context("Неверный release.toml")?;
+    pub fn from_root(root: PathBuf, config_path: Option<PathBuf>) -> Result<Self> {
+        let path = root.join(config_path.as_deref().unwrap_or(Path::new("release.toml")));
+        let bytes = match fs::read(&path) {
+            Ok(bytes) => Some(bytes),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound && config_path.is_none() => {
+                None
+            }
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("Не удалось прочитать {}", path.display()));
+            }
+        };
+        let text = std::str::from_utf8(bytes.as_deref().unwrap_or_default())?;
+        // Keep fingerprints of existing complete configurations compatible with saved releases.
+        let explicit = bytes
+            .as_ref()
+            .and_then(|_| toml::from_str::<Config>(text).ok());
+        let inferred = explicit.is_none();
+        let config = match explicit {
+            Some(config) => config,
+            None => discovery::resolve(
+                &root,
+                toml::from_str(text).with_context(|| format!("Неверный {}", path.display()))?,
+            )?,
+        };
         config.validate()?;
         for path in std::iter::once(&config.app)
             .chain(config.frontend.iter().map(|f| &f.path))
@@ -328,20 +362,25 @@ impl Project {
                 );
                 let version =
                     stable_version(identity["version"].as_str().context("Нет Tauri version")?)?;
-                let release: Value = serde_json::from_slice(&fs::read(
-                    root.join(&config.app)
-                        .join(&config.tauri.as_ref().unwrap().release_config),
-                )?)?;
-                if release.get("identifier").is_some()
-                    || release.pointer("/plugins/updater/pubkey").is_some()
-                {
-                    bail!("release_config не должен менять identifier или закреплённый ключ");
+                if let Some(path) = &config.tauri.as_ref().unwrap().release_config {
+                    let release: Value =
+                        serde_json::from_slice(&fs::read(root.join(&config.app).join(path))?)?;
+                    if release.get("identifier").is_some()
+                        || release.pointer("/plugins/updater/pubkey").is_some()
+                    {
+                        bail!("release_config не должен менять identifier или закреплённый ключ");
+                    }
                 }
                 (identity, version)
             }
         };
         let mut hash = Sha256::new();
-        hash.update(&bytes);
+        if inferred {
+            hash.update(b"veruna-pack:inferred:v1\0");
+            hash.update(serde_json::to_vec(&config)?);
+        } else {
+            hash.update(bytes.as_deref().unwrap());
+        }
         hash.update(serde_json::to_vec(&identity)?);
         let fingerprint = format!("{:x}", hash.finalize());
         Ok(Self {

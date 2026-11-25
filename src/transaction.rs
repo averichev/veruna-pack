@@ -68,7 +68,8 @@ fn execute(
     }
     let destination = output.join(version.to_string());
     if destination.try_exists()? {
-        verify(project, &plan, &destination).context("Готовый выпуск конфликтует с планом или повреждён. Файлы сохранены для диагностики; перезапись запрещена")?;
+        verify(project, &plan, &destination)
+            .map_err(|error| release_conflict(project, &plan, &destination, error))?;
         unchanged(project, &plan)?;
     } else {
         // Private keys are loaded only for a new build; verification/recovery needs public keys only.
@@ -85,7 +86,7 @@ fn execute(
         )?;
         fs::remove_file(work.path().join("source.tar"))?;
         let staged_project = Project::from_root(source, project.config_path.clone()).context(
-            "Snapshot должен содержать release.toml, манифесты и закреплённую идентичность",
+            "Snapshot должен содержать манифесты, закреплённую идентичность и используемые настройки",
         )?;
         ensure!(
             staged_project.fingerprint == project.fingerprint,
@@ -136,6 +137,59 @@ fn execute(
     Ok(())
 }
 
+fn shell_path(path: &Path) -> String {
+    format!("'{}'", path.to_string_lossy().replace('\'', "'\\''"))
+}
+
+fn conflict_backup(destination: &Path) -> Option<std::path::PathBuf> {
+    let name = destination.file_name()?.to_string_lossy();
+    for suffix in 1.. {
+        let candidate = destination.with_file_name(format!(".conflict-{name}-{suffix}"));
+        match fs::symlink_metadata(&candidate) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Some(candidate),
+            Err(_) => return None,
+            Ok(_) => (),
+        }
+    }
+    None
+}
+
+fn release_conflict(
+    project: &Project,
+    plan: &Plan,
+    destination: &Path,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    let cli = match &project.config_path {
+        Some(path) => format!("veruna-pack --config {}", shell_path(path)),
+        None => "veruna-pack".into(),
+    };
+    let mut message = format!(
+        "Существующий выпуск конфликтует с планом или повреждён: {}\n\
+         Ожидается версия {}; тег {}; исходный коммит {}\n\n\
+         Причина:\n{error:#}\n\n\
+         Файлы выпуска и Git-теги сохранены без изменений.\n\n\
+         Как исправить:\n\
+         1. Если выпуск уже опубликован: восстановите полный комплект из доверенной копии \
+         и используйте его исходный коммит и настройки. Новые изменения выпускайте под следующей версией.\n\
+         2. Если это незавершённая локальная сборка: сохраните каталог под другим именем и повторите build.\n",
+        destination.display(),
+        plan.version.as_ref().unwrap(),
+        plan.tag.as_ref().unwrap(),
+        plan.source_commit
+    );
+    if let Some(backup) = conflict_backup(destination) {
+        message.push_str(&format!(
+            "\nКоманды для варианта 2 (из корня проекта):\n  cd {}\n  mv -n {} {}\n  {cli} build\n",
+            shell_path(&project.root),
+            shell_path(destination),
+            shell_path(&backup)
+        ));
+    }
+    message.push_str(&format!("\nДля сверки текущего плана: {cli} plan"));
+    anyhow::anyhow!(message)
+}
+
 fn publish(source: &Path, destination: &Path) -> Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -172,6 +226,32 @@ mod tests {
     use super::*;
     use crate::test_support::{Fixture, fake_build, verify_transaction};
     use std::cell::Cell;
+
+    #[test]
+    fn partial_config_builds_from_snapshot_and_repeats() {
+        let f = Fixture::seeded(false);
+        f.use_defaults();
+        fs::write(
+            f.root.join("release.toml"),
+            format!(
+                "[signing]\nprivate_key_file = '{}'\n",
+                f.temp.path().join("test-key.pem").display()
+            ),
+        )
+        .unwrap();
+        f.commit("chore: use automatic release configuration");
+        let project = Project::discover(&f.root).unwrap();
+        execute(&project, fake_build, verify_transaction).unwrap();
+        let tag = f.git(&["rev-parse", "v0.3.0"]);
+        fs::remove_file(f.temp.path().join("test-key.pem")).unwrap();
+        execute(
+            &project,
+            |_, _, _, _, _| panic!("repeat must not rebuild"),
+            verify_transaction,
+        )
+        .unwrap();
+        assert_eq!(f.git(&["rev-parse", "v0.3.0"]), tag);
+    }
 
     #[test]
     fn success_and_repeat_preserve_tag_checksums_and_changelog() {

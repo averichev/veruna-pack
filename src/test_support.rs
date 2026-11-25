@@ -67,6 +67,16 @@ private_key_file = '{}'
     pub fn project(&self) -> Project {
         Project::load(&self.root.join("release.toml")).unwrap()
     }
+    pub fn use_defaults(&self) {
+        fs::remove_file(self.root.join("release.toml")).unwrap();
+        fs::rename(
+            self.root.join("identity.json"),
+            self.root.join("release.config.json"),
+        )
+        .unwrap();
+        fs::create_dir_all(self.root.join("src")).unwrap();
+        fs::write(self.root.join("src/main.rs"), "fn main() {}\n").unwrap();
+    }
     pub fn git(&self, args: &[&str]) -> String {
         git::read(&self.root, args).unwrap()
     }

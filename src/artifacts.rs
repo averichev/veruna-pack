@@ -220,6 +220,20 @@ fn sums(directory: &Path, plan: &Plan) -> Result<String> {
     Ok(sums)
 }
 
+fn metadata_differences(expected: serde_json::Value, actual: serde_json::Value) -> String {
+    expected
+        .as_object()
+        .expect("metadata is an object")
+        .iter()
+        .filter_map(|(field, expected)| {
+            let actual = &actual[field];
+            (expected != actual)
+                .then(|| format!("  {field}: ожидается {expected}; в выпуске {actual}"))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 pub fn verify(project: &Project, plan: &Plan, directory: &Path) -> Result<()> {
     verify_using(project, plan, directory, inspect::verify)
 }
@@ -232,8 +246,11 @@ pub fn verify_using(
 ) -> Result<()> {
     ensure!(
         fs::symlink_metadata(directory)?.file_type().is_dir(),
-        "Ожидается каталог выпуска без symlink"
+        "Ожидается каталог выпуска без symlink: {}",
+        directory.display()
     );
+    let absolute = directory.canonicalize()?;
+    let directory = absolute.as_path();
     let names: BTreeSet<_> = fs::read_dir(directory)?
         .map(|entry| {
             entry?
@@ -242,59 +259,107 @@ pub fn verify_using(
                 .map_err(|_| anyhow::anyhow!("Имя не UTF-8"))
         })
         .collect::<Result<_>>()?;
-    ensure!(
-        names == plan.files.iter().cloned().collect(),
-        "Неверный состав выпуска {}; комплект сохранён для диагностики",
-        directory.display()
-    );
+    let expected_names: BTreeSet<_> = plan.files.iter().cloned().collect();
+    if names != expected_names {
+        let missing: Vec<_> = expected_names.difference(&names).cloned().collect();
+        let extra: Vec<_> = names.difference(&expected_names).cloned().collect();
+        let list = |names: &[String]| {
+            if names.is_empty() {
+                "нет".into()
+            } else {
+                format!("\n  {}", names.join("\n  "))
+            }
+        };
+        let legacy_hint = if names.contains("build.json") && !names.contains("release.json") {
+            "\nНайден build.json без release.json: это не полный комплект VerunaPack."
+        } else {
+            ""
+        };
+        anyhow::bail!(
+            "Неверный состав выпуска {}\nОтсутствуют файлы ({}): {}\nЛишние файлы ({}): {}{legacy_hint}",
+            directory.display(),
+            missing.len(),
+            list(&missing),
+            extra.len(),
+            list(&extra)
+        );
+    }
     for name in &names {
         regular(&directory.join(name))?;
     }
     ensure!(
         fs::read_to_string(directory.join("CHANGELOG.md"))? == plan.changelog,
-        "CHANGELOG.md не соответствует диапазону Git"
+        "CHANGELOG.md не соответствует диапазону Git {}..{}",
+        plan.previous_tag.as_deref().unwrap_or("начало истории"),
+        plan.source_commit
     );
-    let manifest: Manifest = serde_json::from_slice(&fs::read(directory.join("release.json"))?)?;
+    let manifest_path = directory.join("release.json");
+    let manifest: Manifest =
+        serde_json::from_slice(&fs::read(&manifest_path)?).with_context(|| {
+            format!(
+                "Не удалось прочитать метаданные {}",
+                manifest_path.display()
+            )
+        })?;
+    let differences = metadata_differences(
+        serde_json::json!({
+            "schema_version": 1,
+            "application": project.config.slug,
+            "identifier": project.identifier(),
+            "profile": project.config.profile,
+            "version": plan.version.as_ref().map(ToString::to_string),
+            "source_commit": plan.source_commit,
+            "previous_tag": plan.previous_tag,
+            "tag": plan.tag,
+            "config_sha256": project.fingerprint,
+        }),
+        serde_json::to_value(&manifest)?,
+    );
     ensure!(
-        manifest.schema_version == 1
-            && manifest.application == project.config.slug
-            && manifest.identifier == project.identifier()
-            && manifest.profile == project.config.profile
-            && Some(&manifest.version) == plan.version.as_ref().map(ToString::to_string).as_ref()
-            && manifest.source_commit == plan.source_commit
-            && manifest.previous_tag == plan.previous_tag
-            && Some(&manifest.tag) == plan.tag.as_ref()
-            && manifest.config_sha256 == project.fingerprint,
-        "release.json не соответствует исходному коммиту, конфигурации или версии; комплект сохранён"
+        differences.is_empty(),
+        "release.json не соответствует плану:\n{differences}"
     );
-    stable_version(&manifest.cli_version)?;
+    stable_version(&manifest.cli_version).context("Некорректная cli_version в release.json")?;
     let expected = specs(project, plan);
     ensure!(
         manifest.artifacts.len() == expected.len(),
-        "Неверное число артефактов"
+        "Неверное число артефактов в release.json: ожидается {}, в выпуске {}",
+        expected.len(),
+        manifest.artifacts.len()
     );
     for (artifact, spec) in manifest.artifacts.iter().zip(expected) {
+        let differences = metadata_differences(
+            serde_json::to_value(&spec)?,
+            serde_json::to_value(&artifact.spec)?,
+        );
         ensure!(
-            artifact.spec == spec,
-            "Метаданные не соответствуют плану: {}",
+            differences.is_empty(),
+            "Метаданные артефакта в release.json не соответствуют плану: {}\n{differences}",
             spec.name
         );
         let actual = record(directory, spec.clone())?;
         ensure!(
             *artifact == actual,
-            "Повреждён файл {}; комплект сохранён для диагностики",
-            spec.name
+            "Повреждён файл {}\n  Размер: ожидается {} байт; фактически {} байт\n  SHA-256: ожидается {}; фактически {}",
+            spec.name,
+            artifact.size_bytes,
+            actual.size_bytes,
+            artifact.sha256,
+            actual.sha256
         );
         if let Some(signature) = &spec.signature {
-            let signature = fs::read_to_string(directory.join(signature))?;
+            let signature_path = directory.join(signature);
+            let signature = fs::read_to_string(&signature_path)
+                .with_context(|| format!("Не удалось прочитать {}", signature_path.display()))?;
             match project.config.profile {
                 Profile::Standalone => {
-                    signing::verify_jws(project, &manifest.version, artifact, &signature)?
+                    signing::verify_jws(project, &manifest.version, artifact, &signature)
                 }
                 Profile::Tauri => {
-                    signing::verify_tauri(project, &directory.join(&spec.name), &signature)?
+                    signing::verify_tauri(project, &directory.join(&spec.name), &signature)
                 }
             }
+            .with_context(|| format!("Проверка подписи {}", signature_path.display()))?;
         }
         if spec.roles != ["signature"] {
             inspect(project, plan, directory, &spec)

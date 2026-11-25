@@ -59,17 +59,17 @@ fs.writeFileSync(process.argv[2],JSON.stringify(publicKey.export({format:'jwk'})
         commit(repo, 'test: disposable updater key and loopback endpoint')
         run('git', 'tag', 'v' + args.base_version, cwd=repo)
     for source, name, example, obsolete in [
-        (mock, 'mockport-next', 'mockport.release.toml', ['scripts/release.mjs', 'scripts/release-lib.mjs', 'scripts/release.sh', 'scripts/build.mjs']),
+        (mock, 'mockport-next', None, ['scripts/release.mjs', 'scripts/release-lib.mjs', 'scripts/release.sh', 'scripts/build.mjs']),
         (host, 'host-next', 'moy-host.release.toml', ['scripts/release.py', 'scripts/build_macos.py', 'scripts/collect_release.py', 'Dockerfile.release']),
     ]:
         repo = work / name
         run('git', 'clone', '--no-hardlinks', str(source), str(repo))
-        text = (utility / 'examples' / example).read_text()
-        if name == 'mockport-next':
-            text = text.replace('~/.mockport-signing/publisher.private.pem', str(keys / 'mockport.pem'))
-        else:
+        if example is not None:
+            text = (utility / 'examples' / example).read_text()
             text = text.replace('~/.tauri/host-util.key', str(keys / 'host-util.key'))
-        (repo / 'release.toml').write_text(text)
+            (repo / 'release.toml').write_text(text)
+        else:
+            (repo / 'release.toml').unlink(missing_ok=True)
         (repo / 'Makefile').write_text((utility / 'examples/Makefile').read_text())
         for relative in obsolete:
             (repo / relative).unlink()

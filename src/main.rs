@@ -1,8 +1,10 @@
 mod artifacts;
 mod build;
 mod config;
+mod discovery;
 mod git;
 mod inspect;
+mod node;
 mod plan;
 mod process;
 mod signing;
@@ -17,8 +19,9 @@ use std::path::PathBuf;
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    #[arg(long, default_value = "release.toml", global = true)]
-    config: PathBuf,
+    /// Optional overrides; defaults to release.toml in the Git root when present.
+    #[arg(long, global = true)]
+    config: Option<PathBuf>,
     #[command(subcommand)]
     command: Action,
 }
@@ -38,7 +41,10 @@ enum Action {
 
 fn run() -> Result<()> {
     let args = Cli::parse();
-    let project = config::Project::load(&args.config)?;
+    let project = match args.config {
+        Some(path) => config::Project::load(&path)?,
+        None => config::Project::discover(&std::env::current_dir()?)?,
+    };
     match args.command {
         Action::Plan { json } => {
             let plan = plan::calculate(&project)?;

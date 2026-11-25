@@ -1,5 +1,6 @@
 # syntax=docker/dockerfile:1
-FROM node:22-bookworm-slim AS node
+ARG NODE_VERSION
+FROM node:${NODE_VERSION}-bookworm-slim AS node
 
 FROM ubuntu:22.04 AS toolchain
 ARG RUST_VERSION=1.91.1
@@ -36,7 +37,8 @@ RUN --mount=type=cache,id=veruna-pack-tauri-linux-target,target=/src/target,shar
     rustc -vV && rm -rf /src/target/release/bundle && cd "$APP_DIR" \
     && export TAURI_SIGNING_PRIVATE_KEY="$(cat /run/secrets/tauri_signing_private_key)" \
     && export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(cat /run/secrets/tauri_signing_password)" \
-    && VITE_APP_VERSION="$APP_VERSION" npm exec -- tauri build --ci --config "$RELEASE_CONFIG" --config "$OVERRIDE_CONFIG" --bundles deb -- --locked \
+    && set -- && if [ -n "$RELEASE_CONFIG" ]; then set -- --config "$RELEASE_CONFIG"; fi \
+    && VITE_APP_VERSION="$APP_VERSION" npm exec -- tauri build --ci "$@" --config "$OVERRIDE_CONFIG" --bundles deb -- --locked \
     && mkdir -p /artifacts && cp -R /src/target/release/bundle /artifacts/bundle
 
 FROM toolchain AS windows-build
@@ -62,7 +64,8 @@ RUN --mount=type=cache,id=veruna-pack-tauri-windows-target-${TARGETARCH},target=
     rm -rf /src/target/x86_64-pc-windows-msvc/release/bundle && cd "$APP_DIR" \
     && export TAURI_SIGNING_PRIVATE_KEY="$(cat /run/secrets/tauri_signing_private_key)" \
     && export TAURI_SIGNING_PRIVATE_KEY_PASSWORD="$(cat /run/secrets/tauri_signing_password)" \
-    && VITE_APP_VERSION="$APP_VERSION" npm exec -- tauri build --ci --config "$RELEASE_CONFIG" --config "$OVERRIDE_CONFIG" --runner cargo-xwin --target x86_64-pc-windows-msvc -- --locked \
+    && set -- && if [ -n "$RELEASE_CONFIG" ]; then set -- --config "$RELEASE_CONFIG"; fi \
+    && VITE_APP_VERSION="$APP_VERSION" npm exec -- tauri build --ci "$@" --config "$OVERRIDE_CONFIG" --runner cargo-xwin --target x86_64-pc-windows-msvc -- --locked \
     && mkdir -p /artifacts && cp -R /src/target/x86_64-pc-windows-msvc/release/bundle /artifacts/bundle
 
 FROM scratch AS linux-artifacts

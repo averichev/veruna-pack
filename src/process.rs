@@ -37,6 +37,17 @@ pub fn command(project: &Project, program: impl AsRef<std::ffi::OsStr>, cwd: &Pa
     cmd
 }
 
+pub fn prepend_path(command: &mut Command, directory: &Path) -> Result<()> {
+    let path = command
+        .get_envs()
+        .find(|(name, _)| *name == "PATH")
+        .map(|(_, value)| value.unwrap_or_default().to_owned())
+        .unwrap_or_else(|| std::env::var_os("PATH").unwrap_or_default());
+    let paths = std::iter::once(directory.to_owned()).chain(std::env::split_paths(&path));
+    command.env("PATH", std::env::join_paths(paths)?);
+    Ok(())
+}
+
 pub fn run(cmd: &mut Command, label: &str) -> Result<()> {
     eprintln!("veruna-pack: {label}");
     let status = cmd
