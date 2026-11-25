@@ -129,10 +129,11 @@ fn execute(
     if project.config.push_tag {
         git::push(&project.root, tag)?;
     }
-    println!(
-        "Готовый выпуск: {}\nТег: {tag}\nКоммит: {}",
+    print!(
+        "Готовый выпуск: {}\nТег: {tag}\nКоммит: {}\n\nПримечания к релизу:\n\n{}",
         destination.display(),
-        plan.source_commit
+        plan.source_commit,
+        plan.changelog
     );
     Ok(())
 }
