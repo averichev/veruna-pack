@@ -63,6 +63,7 @@ pub struct Config {
     pub targets: Vec<Target>,
     #[serde(default)]
     pub exclude: Vec<PathBuf>,
+    // Kept in the serialized configuration for existing release fingerprints.
     #[serde(default)]
     pub push_tag: bool,
     pub frontend: Option<Frontend>,

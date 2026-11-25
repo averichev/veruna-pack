@@ -236,11 +236,3 @@ pub fn annotate(root: &Path, tag: &str, commit: &str, changelog: &str) -> Result
         .context("Тег изменился параллельно; готовый выпуск сохранён, повторите build")?;
     Ok(())
 }
-
-pub fn push(root: &Path, tag: &str) -> Result<()> {
-    let reference = format!("refs/tags/{tag}:refs/tags/{tag}");
-    read(root, &["push", "--no-follow-tags", "origin", &reference]).context(
-        "Выпуск и локальный тег сохранены. Не удалось отправить тег; повторите veruna-pack build",
-    )?;
-    Ok(())
-}

@@ -71,6 +71,10 @@ fn execute(
         verify(project, &plan, &destination)
             .map_err(|error| release_conflict(project, &plan, &destination, error))?;
         unchanged(project, &plan)?;
+        eprintln!(
+            "veruna-pack: выпуск {version} для коммита {} уже собран и проверен",
+            plan.source_commit
+        );
     } else {
         // Private keys are loaded only for a new build; verification/recovery needs public keys only.
         let material = Material::load(project)?;
@@ -127,7 +131,9 @@ fn execute(
     git::annotate(&project.root, tag, &plan.source_commit, &plan.changelog)
         .context("Готовый выпуск сохранён. Повторите build, чтобы завершить локальный тег")?;
     if project.config.push_tag {
-        git::push(&project.root, tag)?;
+        eprintln!(
+            "veruna-pack: параметр push_tag устарел. Тег {tag} сохранён только в локальном Git."
+        );
     }
     print!(
         "Готовый выпуск: {}\nТег: {tag}\nКоммит: {}\n\nПримечания к релизу:\n\n{}",
@@ -370,43 +376,22 @@ mod tests {
         assert_eq!(f.git(&["cat-file", "-t", "v0.3.0"]), "tag");
     }
 
-    #[cfg(unix)]
     #[test]
-    fn resume_after_failed_push_sends_only_release_tag() {
-        use std::os::unix::fs::PermissionsExt;
-        let f = Fixture::seeded(true);
-        let base = f.git(&["rev-parse", "v0.2.4"]);
-        f.git(&[
-            "tag",
-            "--no-sign",
-            "-a",
-            "-f",
-            "v0.2.4",
-            &base,
-            "-m",
-            "base release",
-        ]);
-        f.git(&["config", "push.followTags", "true"]);
-        let origin = f.bare_origin();
-        let hook = origin.join("hooks/pre-receive");
-        fs::write(&hook, "#!/bin/sh\nexit 1\n").unwrap();
-        fs::set_permissions(&hook, fs::Permissions::from_mode(0o700)).unwrap();
+    fn successive_builds_tag_each_fix_locally_even_with_legacy_push_enabled() {
+        let f = Fixture::new("0.9.0", true);
+        f.base("v0.9.0");
+        f.commit("fix(updater): поддержать переход с v1");
         let p = f.project();
-        assert!(execute(&p, fake_build, verify_transaction).is_err());
-        let sums = fs::read(f.release().join("SHA256SUMS")).unwrap();
-        let tag = f.git(&["rev-parse", "v0.3.0"]);
-        fs::remove_file(hook).unwrap();
-        fs::remove_file(f.temp.path().join("test-key.pem")).unwrap();
-        execute(
-            &p,
-            |_, _, _, _, _| panic!("must only push tag"),
-            verify_transaction,
-        )
-        .unwrap();
-        assert_eq!(sums, fs::read(f.release().join("SHA256SUMS")).unwrap());
-        assert_eq!(tag, f.git(&["rev-parse", "v0.3.0"]));
-        let refs = git::read(&origin, &["for-each-ref", "--format=%(refname)"]).unwrap();
-        assert_eq!(refs, "refs/tags/v0.3.0");
+        let first = git::head(&f.root).unwrap();
+        execute(&p, fake_build, verify_transaction).unwrap();
+        assert_eq!(f.git(&["rev-parse", "v0.9.1^{commit}"]), first);
+
+        let origin = f.bare_origin();
+        f.commit("fix(ui): перенести обновления в настройки");
+        let second = git::head(&f.root).unwrap();
+        execute(&p, fake_build, verify_transaction).unwrap();
+        assert_eq!(f.git(&["rev-parse", "v0.9.2^{commit}"]), second);
+        assert!(git::read(&origin, &["for-each-ref"]).unwrap().is_empty());
     }
 
     #[test]
