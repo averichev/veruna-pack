@@ -15,7 +15,7 @@ Node.js с npm, совместимый с зависимостями проду�
 ```sh
 git clone git@github.com:averichev/veruna-pack.git
 cd veruna-pack
-cargo install --locked --path . --root "$HOME/.local"
+make update
 ```
 
 Добавьте каталог установки в PATH своей оболочки:
@@ -33,8 +33,13 @@ CLI устанавливается из каталога **утилиты**, а 
 
 ```sh
 git pull --ff-only
-cargo install --locked --path . --root "$HOME/.local" --force
+make update
 ```
+
+`make update` собирает и переустанавливает CLI из текущей рабочей копии в
+`~/.local/bin`, даже если номер версии CLI не изменился. Для локальных изменений
+достаточно одной этой команды; она не выполняет `git pull`. Другой каталог
+установки: `make update PREFIX="$HOME/my-tools"` — бинарник окажется в его `bin/`.
 
 Для standalone дополнительно нужны Zig, cargo-zigbuild 0.23.0 и MinGW-w64:
 
