@@ -46,18 +46,38 @@ fn unchanged(project: &Project, expected: &Plan) -> Result<()> {
     Ok(())
 }
 
+fn current_release_status(releases: &Path, tag: Option<&str>) -> String {
+    let Some(tag) = tag else {
+        return "В истории этой ветки ещё нет релизных тегов.".into();
+    };
+    let directory = releases.join(tag.trim_start_matches('v'));
+    let path = directory.display();
+    let location = match directory.symlink_metadata() {
+        Ok(metadata) if metadata.is_dir() => format!("Каталог выпуска: {path}"),
+        Ok(_) => format!("По пути выпуска ожидался каталог: {path}"),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            format!("Локальный каталог выпуска не найден: {path}")
+        }
+        Err(error) => format!("Не удалось проверить каталог выпуска {path}: {error}"),
+    };
+    format!("Текущий выпуск: {tag}\n{location}")
+}
+
 fn execute(
     project: &Project,
     builder: impl Fn(&Project, &Plan, &Path, &Path, &Material) -> Result<()>,
     verify: impl Fn(&Project, &Plan, &Path) -> Result<()>,
 ) -> Result<()> {
     let plan = plan::calculate(project)?;
+    let output = project.root.join("releases");
     let Some(version) = &plan.version else {
-        println!("Нового выпуска нет");
+        println!(
+            "Нового выпуска нет\n{}",
+            current_release_status(&output, plan.previous_tag.as_deref())
+        );
         return Ok(());
     };
     git::clean(project)?;
-    let output = project.root.join("releases");
     if output.try_exists()? {
         ensure!(
             fs::symlink_metadata(&output)?.file_type().is_dir(),
@@ -236,6 +256,36 @@ mod tests {
         test_support::{Fixture, fake_build, verify_transaction},
     };
     use std::cell::Cell;
+
+    #[test]
+    fn current_release_reports_the_tag_and_local_directory_when_available() {
+        let temp = tempfile::tempdir().unwrap();
+        let releases = temp.path().join("releases");
+        let directory = releases.join("1.2.3");
+        let tag = Some("v1.2.3");
+
+        assert_eq!(
+            current_release_status(&releases, None),
+            "В истории этой ветки ещё нет релизных тегов."
+        );
+        assert_eq!(
+            current_release_status(&releases, tag),
+            format!(
+                "Текущий выпуск: v1.2.3\nЛокальный каталог выпуска не найден: {}",
+                directory.display()
+            )
+        );
+        assert!(!releases.exists());
+
+        fs::create_dir_all(&directory).unwrap();
+        assert_eq!(
+            current_release_status(&releases, tag),
+            format!(
+                "Текущий выпуск: v1.2.3\nКаталог выпуска: {}",
+                directory.display()
+            )
+        );
+    }
 
     #[test]
     fn chosen_binary_builds_from_snapshot_and_repeats() {
