@@ -276,6 +276,26 @@ pub fn stable_version(value: &str) -> Result<Version> {
     Ok(version)
 }
 
+fn missing_signing_identity(path: &Path, settings_path: &Path) -> anyhow::Error {
+    let template = r#"{
+  "product_id": "<UUID продукта>",
+  "updates": {
+    "public_key": { "kty": "OKP", "crv": "Ed25519", "x": "<публичный ключ в base64url без дополнения>" }
+  }
+}"#;
+    anyhow::anyhow!(
+        "Не найден файл «{}» с данными для проверки подписи обновлений.\n\
+         Создайте его по указанному пути от корня репозитория. Подставьте постоянный UUID продукта и публичный ключ Ed25519, которым приложение проверяет обновления.\n\
+         {template}\n\n\
+         Если такой JSON уже есть, задайте signing.identity в «{}», указав путь от корня репозитория.\n\
+         [signing]\n\
+         identity = \"путь/к/файлу.json\"\n\n\
+         Перед сборкой зафиксируйте изменения в Git.",
+        path.display(),
+        settings_path.display()
+    )
+}
+
 impl Project {
     pub fn discover(directory: &Path, selection: Selection) -> Result<Self> {
         let root = PathBuf::from(git::read(directory, &["rev-parse", "--show-toplevel"])?);
@@ -303,7 +323,8 @@ impl Project {
         config_path: Option<PathBuf>,
         mut selection: Selection,
     ) -> Result<Self> {
-        let path = root.join(config_path.as_deref().unwrap_or(Path::new("release.toml")));
+        let settings_path = config_path.as_deref().unwrap_or(Path::new("release.toml"));
+        let path = root.join(settings_path);
         let bytes = match fs::read(&path) {
             Ok(bytes) => Some(bytes),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound && config_path.is_none() => {
@@ -329,15 +350,22 @@ impl Project {
             )?,
         };
         config.validate()?;
+        let canonical_root = root.canonicalize()?;
         for path in std::iter::once(&config.app)
             .chain(config.frontend.iter().map(|f| &f.path))
             .chain(config.signing.identity.iter())
         {
+            let resolved = match root.join(path).canonicalize() {
+                Err(error)
+                    if error.kind() == std::io::ErrorKind::NotFound
+                        && config.signing.identity.as_ref() == Some(path) =>
+                {
+                    return Err(missing_signing_identity(path, settings_path));
+                }
+                result => result.with_context(|| format!("Недоступен путь {}", path.display()))?,
+            };
             ensure!(
-                root.join(path)
-                    .canonicalize()
-                    .with_context(|| format!("Недоступен путь {}", path.display()))?
-                    .starts_with(root.canonicalize()?),
+                resolved.starts_with(&canonical_root),
                 "Путь через symlink выходит за пределы Git-репозитория: {}",
                 path.display()
             );

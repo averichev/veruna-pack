@@ -353,6 +353,33 @@ mod tests {
     }
 
     #[test]
+    fn missing_signing_identity_explains_how_to_create_or_locate_it() {
+        let f = Fixture::new("0.2.4", false);
+        f.use_defaults();
+        fs::remove_file(f.root.join("release.config.json")).unwrap();
+        let error = f.discover().unwrap_err().to_string();
+        for hint in [
+            "release.config.json",
+            "Создайте",
+            "\"product_id\"",
+            "\"public_key\"",
+            "Ed25519",
+            "signing.identity",
+            "release.toml",
+        ] {
+            assert!(error.contains(hint), "{error}");
+        }
+
+        let settings = f.root.join("custom.toml");
+        fs::write(&settings, "[signing]\nidentity = 'keys/product.json'\n").unwrap();
+        let error = Project::load(&settings, Selection::default())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("keys/product.json"), "{error}");
+        assert!(error.contains("custom.toml"), "{error}");
+    }
+
+    #[test]
     fn multiple_binaries_require_a_default_or_an_override() {
         let f = Fixture::new("0.2.4", false);
         f.use_defaults();
