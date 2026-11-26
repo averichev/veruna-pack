@@ -151,6 +151,24 @@ pub fn verify_transaction(project: &Project, plan: &Plan, path: &Path) -> Result
 }
 
 #[test]
+fn missing_signing_key_reports_the_resolved_path_and_env_override() {
+    let f = Fixture::new("0.2.4", false);
+    let mut project = f.project();
+    let file = Path::new("keys/publisher.pem");
+    project.config.signing.private_key_file = Some(file.to_owned());
+    let error = Material::load(&project).err().unwrap().to_string();
+    assert!(
+        error.contains(project.root.join(file).to_str().unwrap()),
+        "{error}"
+    );
+    assert!(
+        error.contains(&project.config.signing.private_key_env),
+        "{error}"
+    );
+    assert!(error.contains("signing.private_key_file"), "{error}");
+}
+
+#[test]
 fn jws_rejects_wrong_key_even_with_trusted_kid_and_correct_hashes() {
     let f = Fixture::seeded(false);
     let p = f.project();

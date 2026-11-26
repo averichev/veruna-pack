@@ -58,28 +58,23 @@ pub fn expand(path: &Path) -> Result<PathBuf> {
 
 fn secret(project: &Project) -> Result<Zeroizing<String>> {
     let settings = &project.config.signing;
-    let value = match env::var(&settings.private_key_env) {
+    let name = &settings.private_key_env;
+    let value = match env::var(name) {
         Ok(value) => value,
         Err(env::VarError::NotPresent) => {
-            let path = expand(
-                settings
-                    .private_key_file
-                    .as_deref()
-                    .context("Задайте переменную или локальный файл закрытого ключа")?,
-            )?;
-            return fs::read_to_string(if path.is_absolute() {
-                path
-            } else {
-                project.root.join(path)
-            })
-            .map(Zeroizing::new)
-            .map_err(|_| {
+            let file = settings.private_key_file.as_deref().with_context(|| {
+                format!("Укажите путь к закрытому ключу в переменной {name} или в signing.private_key_file")
+            })?;
+            let path = project.root.join(expand(file)?);
+            return fs::read_to_string(&path).map(Zeroizing::new).map_err(|error| {
                 anyhow::anyhow!(
-                    "Не удалось прочитать локальный закрытый ключ; содержимое не выводится"
+                    "Не удалось прочитать файл закрытого ключа «{}» ({error}).\n\
+                     Укажите путь к существующему ключу в переменной {name} или в signing.private_key_file.",
+                    path.display()
                 )
             });
         }
-        Err(_) => anyhow::bail!("Закрытый ключ должен быть UTF-8"),
+        Err(_) => anyhow::bail!("Значение {name} должно быть в UTF-8"),
     };
     let value = Zeroizing::new(value);
     if value.starts_with("-----BEGIN ")
@@ -89,8 +84,13 @@ fn secret(project: &Project) -> Result<Zeroizing<String>> {
     {
         return Ok(value);
     }
-    let path = expand(Path::new(value.as_str()))?;
-    fs::read_to_string(if path.is_absolute() { path } else { project.root.join(path) }).map(Zeroizing::new).map_err(|_| anyhow::anyhow!("Переменная закрытого ключа не содержит ключ или доступный путь; содержимое не выводится"))
+    let path = project.root.join(expand(Path::new(value.as_str()))?);
+    // The environment value may be malformed key material. Keep it out of diagnostics.
+    fs::read_to_string(path).map(Zeroizing::new).map_err(|_| {
+        anyhow::anyhow!(
+            "В переменной {name} укажите закрытый ключ или путь к доступному файлу ключа."
+        )
+    })
 }
 
 pub enum Material {
