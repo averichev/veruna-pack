@@ -26,7 +26,11 @@ struct Jwk {
 }
 
 fn jwk(project: &Project) -> Result<(VerifyingKey, String)> {
-    let jwk: Jwk = serde_json::from_value(project.identity["updates"]["public_key"].clone())?;
+    let source = project.identity.get("updates").unwrap_or(&project.identity);
+    let key = source
+        .get("public_key")
+        .context("В signing.identity отсутствует public_key")?;
+    let jwk: Jwk = serde_json::from_value(key.clone())?;
     ensure!(
         jwk.kty == "OKP" && jwk.crv == "Ed25519",
         "Ожидается публичный OKP/Ed25519 JWK"

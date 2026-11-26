@@ -118,17 +118,26 @@ fn preflight(project: &Project, work: &Path) -> Result<()> {
             process::capture(process::command(project, &rustc, &project.root).args(["--crate-type=lib", "--emit=metadata", "--target", triple, "--out-dir"]).arg(work).arg(&probe), "проверка стандартной библиотеки Rust").with_context(|| format!("Установите target в выбранный toolchain: rustup target add --toolchain {toolchain} {triple}"))?;
         }
     }
+    let includes = |os: &str| project.config.targets.iter().any(|target| target.os == os);
     match project.config.profile {
         Profile::Standalone => {
-            check(project, "zig", &["version"])?;
-            check(project, "cargo-zigbuild", &["--version"])?;
-            check(project, "x86_64-w64-mingw32-gcc", &["--version"])?;
-            check(project, "x86_64-w64-mingw32-ar", &["--version"])?;
+            if includes("linux") {
+                check(project, "zig", &["version"])?;
+                check(project, "cargo-zigbuild", &["--version"])?;
+            }
+            if includes("windows") {
+                check(project, "x86_64-w64-mingw32-gcc", &["--version"])?;
+                check(project, "x86_64-w64-mingw32-ar", &["--version"])?;
+            }
         }
         Profile::Tauri => {
-            check(project, "7zz", &["i"])?;
-            check(project, "docker", &["info", "--format", "{{.OSType}}"])?;
-            check(project, "docker", &["buildx", "version"])?;
+            if includes("windows") {
+                check(project, "7zz", &["i"])?;
+            }
+            if includes("linux") || includes("windows") {
+                check(project, "docker", &["info", "--format", "{{.OSType}}"])?;
+                check(project, "docker", &["buildx", "version"])?;
+            }
         }
     }
     Ok(())

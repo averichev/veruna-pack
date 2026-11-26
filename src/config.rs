@@ -128,7 +128,7 @@ fn docker_rust() -> String {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct Signing {
-    /// Standalone identity JSON: product_id and updates.public_key.
+    /// Standalone identity JSON with product_id and a pinned Ed25519 public key.
     pub identity: Option<PathBuf>,
     pub private_key_env: String,
     pub private_key_file: Option<PathBuf>,
@@ -207,8 +207,8 @@ impl Config {
             ensure!(env_name(p), "Неверное имя signing.password_env");
         }
         ensure!(
-            self.targets.len() == 3,
-            "Полный выпуск требует ровно три цели: linux, windows, macos"
+            !self.targets.is_empty(),
+            "Укажите хотя бы одну цель в targets"
         );
         let mut platforms = BTreeSet::new();
         for t in &self.targets {

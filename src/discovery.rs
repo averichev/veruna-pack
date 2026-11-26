@@ -97,6 +97,16 @@ fn in_app(app: &Path, path: &str) -> PathBuf {
     }
 }
 
+fn standalone_identity(root: &Path, app: &Path) -> PathBuf {
+    let release = in_app(app, "release.config.json");
+    let updates = in_app(app, "update-identity.json");
+    if !root.join(&release).exists() && root.join(&updates).is_file() {
+        updates
+    } else {
+        release
+    }
+}
+
 fn select_app(
     root: &Path,
     profile: Option<&Profile>,
@@ -263,7 +273,7 @@ pub fn resolve(root: &Path, overrides: Value, selection: &mut Selection) -> Resu
             "password_env": "TAURI_SIGNING_PRIVATE_KEY_PASSWORD",
             "private_key_file": format!("~/.tauri/{slug}.key"),
         }) } else { json!({
-            "identity": in_app(&app, "release.config.json"),
+            "identity": standalone_identity(root, &app),
             "private_key_env": format!("{prefix}_SIGNING_KEY"),
             "password_env": format!("{prefix}_KEY_PASSPHRASE"),
             "private_key_file": format!("~/.{slug}-signing/publisher.private.pem"),
@@ -339,6 +349,24 @@ mod tests {
         let error = format!("{:#}", f.discover().unwrap_err());
         assert!(error.contains("unknown field `feautres`"), "{error}");
         fs::write(&config, "[not valid toml").unwrap();
+        assert!(f.discover().is_err());
+    }
+
+    #[test]
+    fn linux_only_release_contains_the_executable_and_its_signature() {
+        let f = Fixture::new("0.2.4", false);
+        f.use_defaults();
+        let config = f.root.join("release.toml");
+        fs::write(&config, "targets = [{ os = 'linux', arch = 'x86_64' }]").unwrap();
+        f.commit("fix: Исправлена сборка");
+        let project = f.discover().unwrap();
+        let plan = crate::plan::calculate(&project).unwrap();
+        let specs = crate::artifacts::specs(&project, &plan);
+        assert_eq!(specs.len(), 2);
+        assert_eq!(specs[0].os, "linux");
+        assert_eq!(specs[0].signature.as_ref(), Some(&specs[1].name));
+
+        fs::write(config, "targets = []").unwrap();
         assert!(f.discover().is_err());
     }
 
@@ -495,6 +523,36 @@ mod tests {
         assert!(
             format!("{:#}", f.discover().unwrap_err()).contains("release_config не должен менять")
         );
+    }
+
+    #[test]
+    fn standalone_can_use_its_flat_update_identity_for_signing() {
+        let f = Fixture::new("0.2.4", false);
+        f.use_defaults();
+        fs::write(
+            f.root.join("release.toml"),
+            format!(
+                "[signing]\nprivate_key_file = '{}'\n",
+                f.temp.path().join("test-key.pem").display()
+            ),
+        )
+        .unwrap();
+        let original = f.discover().unwrap();
+        let path = "update-identity.json";
+        let identity = json!({
+            "product_id": original.identifier(),
+            "public_key": original.identity["updates"]["public_key"],
+        });
+        fs::write(f.root.join(path), serde_json::to_vec(&identity).unwrap()).unwrap();
+        assert_eq!(f.discover().unwrap().fingerprint, original.fingerprint);
+        fs::remove_file(f.root.join("release.config.json")).unwrap();
+        let project = f.discover().unwrap();
+        assert_eq!(
+            project.config.signing.identity.as_deref(),
+            Some(Path::new(path))
+        );
+        assert_eq!(project.identifier(), original.identifier());
+        crate::signing::Material::load(&project).unwrap();
     }
 
     #[test]

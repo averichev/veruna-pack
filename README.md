@@ -42,7 +42,8 @@ make update
 достаточно одной этой команды; она не выполняет `git pull`. Другой каталог
 установки: `make update PREFIX="$HOME/my-tools"` — бинарник окажется в его `bin/`.
 
-Для standalone дополнительно нужны Zig, cargo-zigbuild 0.23.0 и MinGW-w64:
+Для Linux в профиле standalone нужны Zig и cargo-zigbuild 0.23.0, для Windows нужен MinGW-w64.
+Следующие команды готовят Mac для всех трёх платформ.
 
 ```sh
 xcode-select --install
@@ -154,6 +155,8 @@ private_key_file = "~/.tauri/host-util.key"
 
 Другие переопределения: `rust.features = ["feature"]`, `frontend.version_env`,
 `frontend.enabled = false`, `targets` и параметры подписи.
+Для выпуска только под Linux x86-64 задайте в корне TOML
+`targets = [{ os = "linux", arch = "x86_64" }]`. По умолчанию собираются Linux, Windows и macOS.
 Таблицы дополняются по полям, списки заменяются целиком. Неизвестные поля и
 ошибочный TOML останавливают запуск. Полные конфигурации прежнего формата
 поддерживаются, включая проверку ранее созданных выпусков.
@@ -217,8 +220,11 @@ CLI использует существующие ключи продукта и
 Пароль берётся из `password_env`; без него используется пустая строка,
 интерактивного запроса нет. Ключи не записываются в комплект выпуска.
 
-Standalone читает постоянный UUID `product_id` и публичный OKP/Ed25519 JWK
-из `signing.identity` (`updates.public_key`). PKCS#8 PEM может быть зашифрован.
+Для standalone CLI ищет `release.config.json`, затем `update-identity.json`
+рядом с Cargo.toml приложения. Через `signing.identity` можно указать файл явно.
+Он содержит постоянный UUID в `product_id` и публичный OKP/Ed25519 JWK
+в `updates.public_key` или, для файла без секции `updates`, в `public_key`.
+PKCS#8 PEM может быть зашифрован.
 Сохраняется JWS Compact/EdDSA: typ `releases-standalone+jws`, RFC 7638 kid,
 schema_version 1, application_id, version, os, arch, size_bytes и sha256.
 macOS называется `macos` в имени файла и `darwin` в протоколе обновления.
@@ -254,8 +260,8 @@ Git submodules пока не поддерживаются.
 Затем создаётся тег. Ошибка сборки/проверки не создаёт итоговый каталог и тег;
 временный каталог сохраняется для диагностики, его путь выводится в ошибке.
 
-В комплекте есть `CHANGELOG.md`, `release.json`, `SHA256SUMS`, три основных
-дистрибутива и все фактические updater/signature-файлы. release.json содержит
+В комплекте есть `CHANGELOG.md`, `release.json`, `SHA256SUMS`, дистрибутивы
+выбранных платформ и все фактические updater/signature-файлы. release.json содержит
 версии продукта/CLI, SHA, оба тега, идентичность, fingerprint конфигурации,
 OS/архитектуру/protocol target, роли, имя, размер, SHA-256 и имя подписи.
 SHA256SUMS покрывает все остальные файлы, включая changelog, metadata и подписи.
