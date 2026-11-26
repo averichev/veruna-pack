@@ -139,6 +139,7 @@ pub struct Signing {
 pub struct Project {
     pub root: PathBuf,
     pub config_path: Option<PathBuf>,
+    discovery_dir: PathBuf,
     selection: Selection,
     pub config: Config,
     pub identity: Value,
@@ -299,7 +300,8 @@ fn missing_signing_identity(path: &Path, settings_path: &Path) -> anyhow::Error 
 impl Project {
     pub fn discover(directory: &Path, selection: Selection) -> Result<Self> {
         let root = PathBuf::from(git::read(directory, &["rev-parse", "--show-toplevel"])?);
-        Self::from_root(root, None, selection)
+        let discovery_dir = directory.canonicalize()?.strip_prefix(&root)?.to_owned();
+        Self::from_root(root, None, discovery_dir, selection)
     }
 
     pub fn load(path: &Path, selection: Selection) -> Result<Self> {
@@ -311,16 +313,26 @@ impl Project {
             &["rev-parse", "--show-toplevel"],
         )?);
         let config_path = path.strip_prefix(&root)?.to_owned();
-        Self::from_root(root, Some(config_path), selection)
+        let discovery_dir = std::env::current_dir()?
+            .strip_prefix(&root)
+            .unwrap_or(Path::new(""))
+            .to_owned();
+        Self::from_root(root, Some(config_path), discovery_dir, selection)
     }
 
     pub fn reload_at(&self, root: PathBuf) -> Result<Self> {
-        Self::from_root(root, self.config_path.clone(), self.selection.replay())
+        Self::from_root(
+            root,
+            self.config_path.clone(),
+            self.discovery_dir.clone(),
+            self.selection.replay(),
+        )
     }
 
     fn from_root(
         root: PathBuf,
         config_path: Option<PathBuf>,
+        discovery_dir: PathBuf,
         mut selection: Selection,
     ) -> Result<Self> {
         let settings_path = config_path.as_deref().unwrap_or(Path::new("release.toml"));
@@ -345,6 +357,7 @@ impl Project {
             Some(config) => config,
             None => discovery::resolve(
                 &root,
+                &discovery_dir,
                 toml::from_str(text).with_context(|| format!("Неверный {}", path.display()))?,
                 &mut selection,
             )?,
@@ -426,6 +439,7 @@ impl Project {
         Ok(Self {
             root,
             config_path,
+            discovery_dir,
             selection,
             config,
             identity,

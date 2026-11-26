@@ -97,6 +97,17 @@ fn in_app(app: &Path, path: &str) -> PathBuf {
     }
 }
 
+fn is_standalone(root: &Path, directory: &Path) -> Result<bool> {
+    let app = root.join(directory);
+    let cargo = app.join("Cargo.toml");
+    if !cargo.is_file()
+        || (directory.ends_with("src-tauri") && app.join("tauri.conf.json").is_file())
+    {
+        return Ok(false);
+    }
+    Ok(!binaries(&app, &manifest(&cargo)?)?.is_empty())
+}
+
 fn standalone_identity(root: &Path, app: &Path) -> PathBuf {
     let release = in_app(app, "release.config.json");
     let updates = in_app(app, "update-identity.json");
@@ -109,6 +120,7 @@ fn standalone_identity(root: &Path, app: &Path) -> PathBuf {
 
 fn select_app(
     root: &Path,
+    discovery_dir: &Path,
     profile: Option<&Profile>,
     exclude: &[PathBuf],
     selection: &mut Selection,
@@ -122,33 +134,52 @@ fn select_app(
     directories.sort();
     directories.dedup();
     directories.retain(|path| !exclude.iter().any(|excluded| path.starts_with(excluded)));
-    if profile != Some(&Profile::Standalone) {
-        let tauri: Vec<_> = directories
-            .iter()
-            .filter(|p| root.join(p).join("src-tauri/tauri.conf.json").is_file())
-            .cloned()
-            .collect();
-        if !tauri.is_empty() {
-            return selection.choose(Choice::Application("Tauri"), tauri);
-        }
-    }
+    let tauri: BTreeSet<&Path> = directories
+        .iter()
+        .map(PathBuf::as_path)
+        .filter(|p| {
+            profile != Some(&Profile::Standalone)
+                && root.join(p).join("src-tauri/tauri.conf.json").is_file()
+        })
+        .collect();
     ensure!(
-        profile != Some(&Profile::Tauri),
+        profile != Some(&Profile::Tauri) || !tauri.is_empty(),
         "Tauri-приложение не найдено. Укажите app в release.toml"
     );
-    let root_manifest = root.join("Cargo.toml");
-    if root_manifest.is_file() && !binaries(root, &manifest(&root_manifest)?)?.is_empty() {
-        return Ok(PathBuf::from("."));
-    }
-    let mut standalone = Vec::new();
-    for directory in directories {
-        let app = root.join(&directory);
-        let path = app.join("Cargo.toml");
-        if path.is_file() && !binaries(&app, &manifest(&path)?)?.is_empty() {
-            standalone.push(directory);
+    let is_app =
+        |path: &Path| -> Result<bool> {
+            Ok(tauri.contains(path)
+                || (profile != Some(&Profile::Tauri) && is_standalone(root, path)?))
+        };
+    if !discovery_dir.as_os_str().is_empty() {
+        for ancestor in discovery_dir.ancestors() {
+            let path = if ancestor.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                ancestor
+            };
+            if directories.iter().any(|dir| dir == path) && is_app(path)? {
+                return Ok(path.to_owned());
+            }
         }
     }
-    selection.choose(Choice::Application("Rust"), standalone)
+    if tauri.is_empty() && is_standalone(root, Path::new("."))? {
+        return Ok(PathBuf::from("."));
+    }
+    let mut apps = Vec::new();
+    for directory in &directories {
+        if is_app(directory)? {
+            apps.push(directory.clone());
+        }
+    }
+    let kind = if tauri.is_empty() {
+        "Rust"
+    } else if tauri.len() == apps.len() {
+        "Tauri"
+    } else {
+        "Rust/Tauri"
+    };
+    selection.choose(Choice::Application(kind), apps)
 }
 
 fn merge(base: &mut Value, overrides: Value) {
@@ -197,7 +228,12 @@ fn frontend(root: &Path, app: &Path, overrides: &Value, tauri: bool) -> Result<V
     })
 }
 
-pub fn resolve(root: &Path, overrides: Value, selection: &mut Selection) -> Result<Config> {
+pub fn resolve(
+    root: &Path,
+    discovery_dir: &Path,
+    overrides: Value,
+    selection: &mut Selection,
+) -> Result<Config> {
     let profile: Option<Profile> = overrides
         .get("profile")
         .map(|value| serde_json::from_value(value.clone()))
@@ -212,7 +248,7 @@ pub fn resolve(root: &Path, overrides: Value, selection: &mut Selection) -> Resu
     }
     let app = match overrides.get("app") {
         Some(value) => serde_json::from_value::<PathBuf>(value.clone())?,
-        None => select_app(root, profile.as_ref(), &exclude, selection)?,
+        None => select_app(root, discovery_dir, profile.as_ref(), &exclude, selection)?,
     };
     crate::config::relative(&app)?;
     let profile = profile.unwrap_or_else(|| {
@@ -453,13 +489,10 @@ mod tests {
         assert_eq!(project.config.slug, "server");
     }
 
-    #[test]
-    fn tauri_is_discovered_in_a_monorepo_without_a_release_overlay() {
-        let f = Fixture::new("0.2.4", false);
-        f.use_defaults();
-        let app = f.root.join("apps/desktop");
+    fn create_tauri_app(app: &Path) {
         let tauri = app.join("src-tauri");
-        fs::create_dir_all(&tauri).unwrap();
+        fs::create_dir_all(tauri.join("src")).unwrap();
+        fs::write(tauri.join("src/main.rs"), "fn main() {}\n").unwrap();
         fs::write(
             tauri.join("Cargo.toml"),
             "[package]\nname='sample-desktop'\nversion='0.2.4'\n",
@@ -471,6 +504,16 @@ mod tests {
             r#"{"scripts":{"build":"vite build"}}"#,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn tauri_is_discovered_in_a_monorepo_without_a_release_overlay() {
+        let f = Fixture::new("0.2.4", false);
+        f.use_defaults();
+        fs::remove_file(f.root.join("src/main.rs")).unwrap();
+        let app = f.root.join("apps/desktop");
+        create_tauri_app(&app);
+        let tauri = app.join("src-tauri");
         let project = f.discover().unwrap();
         assert_eq!(project.config.profile, Profile::Tauri);
         assert_eq!(project.config.app, Path::new("apps/desktop"));
@@ -523,6 +566,77 @@ mod tests {
         assert!(
             format!("{:#}", f.discover().unwrap_err()).contains("release_config не должен менять")
         );
+    }
+
+    #[test]
+    fn mixed_apps_can_be_selected_from_the_root_or_their_own_directory() {
+        let f = Fixture::new("0.2.4", false);
+        f.use_defaults();
+        let server = f.root.join("crates/server");
+        fs::create_dir_all(&server).unwrap();
+        for name in ["Cargo.toml", "src", "release.config.json"] {
+            fs::rename(f.root.join(name), server.join(name)).unwrap();
+        }
+        create_tauri_app(&f.root);
+        fs::write(
+            f.root.join("Cargo.toml"),
+            "[workspace]\nmembers=['src-tauri','crates/server']\n",
+        )
+        .unwrap();
+        f.commit("feat: add desktop and server");
+
+        let error = f.discover().unwrap_err().to_string();
+        assert!(
+            error.contains("Rust/Tauri-приложений: ., crates/server"),
+            "{error}"
+        );
+        let chosen = Project::discover(
+            &f.root,
+            Selection::with_prompt(|_, options, _| {
+                assert_eq!(options, [".", "crates/server"]);
+                Ok(1)
+            }),
+        )
+        .unwrap();
+        assert_eq!(chosen.config.app, Path::new("crates/server"));
+        assert_eq!(chosen.config.profile, Profile::Standalone);
+
+        let nested = Project::discover(&server.join("src"), Selection::default()).unwrap();
+        assert_eq!(nested.fingerprint, chosen.fingerprint);
+        let source = f.temp.path().join("snapshot");
+        git::snapshot(
+            &f.root,
+            &git::head(&f.root).unwrap(),
+            &source,
+            &f.temp.path().join("source.tar"),
+        )
+        .unwrap();
+        for project in [chosen, nested] {
+            assert_eq!(
+                project.reload_at(source.clone()).unwrap().fingerprint,
+                project.fingerprint
+            );
+        }
+        let desktop =
+            Project::discover(&f.root.join("src-tauri/src"), Selection::default()).unwrap();
+        assert_eq!(desktop.config.profile, Profile::Tauri);
+
+        for settings in [
+            "app = '.'",
+            "profile = 'tauri'",
+            "exclude = ['crates/server']",
+        ] {
+            fs::write(f.root.join("release.toml"), settings).unwrap();
+            assert_eq!(
+                Project::discover(&server, Selection::default())
+                    .unwrap()
+                    .config
+                    .profile,
+                Profile::Tauri
+            );
+        }
+        fs::write(f.root.join("release.toml"), "profile = 'standalone'").unwrap();
+        assert_eq!(f.discover().unwrap().config.app, Path::new("crates/server"));
     }
 
     #[test]
